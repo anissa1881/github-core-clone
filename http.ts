@@ -1,6 +1,6 @@
-// http.ts: the small HTTP helpers every surface shares: a JSON reply that always carries
-// GitHub's request-id header, a body reader that rejects malformed JSON with 400, and the
-// bearer-token check the rules require.
+// http.ts: the small HTTP helpers every surface shares: a JSON reply that always carries GitHub's
+// request-id header, a body reader that rejects malformed JSON with 400, and the token checks the
+// rules require of a read or a write.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
@@ -31,7 +31,11 @@ export function respond(
 }
 
 /** Send an empty reply (204 and the like). */
-export function respondEmpty(res: ServerResponse, status: number, headers: Readonly<Record<string, string>> = {}): void {
+export function respondEmpty(
+  res: ServerResponse,
+  status: number,
+  headers: Readonly<Record<string, string>> = {},
+): void {
   if (res.headersSent) return;
   res.writeHead(status, { 'x-github-request-id': requestId(), ...headers });
   res.end();
@@ -45,10 +49,13 @@ export async function readRaw(req: IncomingMessage): Promise<Buffer> {
 }
 
 /**
- * Read a request's body as parsed JSON. A body that is not JSON answers 400 and returns null, so
- * the caller stops; an empty body is an empty object (GitHub treats a missing body as {}).
+ * Read a request's body as parsed JSON. A body that is not a JSON object answers 400 and returns
+ * null so the caller stops; an empty body is an empty object, as GitHub treats a missing body.
  */
-export async function readBody(req: IncomingMessage, res: ServerResponse): Promise<Record<string, unknown> | null> {
+export async function readBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<Record<string, unknown> | null> {
   const raw = await readRaw(req);
   const text = raw.toString('utf8').trim();
   if (text === '') return {};
@@ -93,7 +100,7 @@ export function basicTokenOf(req: IncomingMessage): string | null {
   return decoded.slice(colon + 1);
 }
 
-/** Whether the request may read the forge: a bearer token, or git's Basic token. */
+/** Whether the request may use the forge: a bearer token, or git's Basic token. */
 export function authorized(req: IncomingMessage, token: string): boolean {
   return bearerOf(req) === token || basicTokenOf(req) === token;
 }

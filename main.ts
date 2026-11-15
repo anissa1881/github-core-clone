@@ -1,20 +1,20 @@
-// main.ts: the entry's lifecycle against the env. The suite starts beside this program, so the
-// program must bind an ephemeral port, tell the env which port it bound, serve until the env says
-// the trial is over, then exit 0. A program that never registers leaves no working forge.
+// main.ts: the entry's lifecycle against the env. The test suite runs beside this program, so the
+// program binds an ephemeral port, announces that port to the env, serves until the env reports the
+// trial is over, and then exits 0. A program that never registers leaves the env with nothing to test.
 
 import { createApp } from './app.ts';
 
-/** The env's origin, from MAKEFUN_ENV_URL; without it there is nothing to talk to. */
+/** Where the env listens, from MAKEFUN_ENV_URL. Without it there is no env to talk to. */
 const ENV_URL = readEnvUrl();
 
-/** How long one register or done request may take before it is abandoned and retried. */
+/** How long a single register or done request may take before it is abandoned and retried. */
 const REQUEST_TIMEOUT_MS = 30_000;
-/** The first wait between retries. */
+/** The wait before the first retry. */
 const RETRY_INITIAL_MS = 250;
 /** The longest wait between retries. */
 const RETRY_MAX_MS = 2_000;
 
-/** Read MAKEFUN_ENV_URL, trimmed of trailing slashes. */
+/** The env's origin with any trailing slashes removed. */
 function readEnvUrl(): string {
   const raw = process.env.MAKEFUN_ENV_URL ?? '';
   return raw.replace(/\/+$/, '');
@@ -27,16 +27,19 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-/** The wait after `attempt` failed requests: exponential from the initial delay, capped. */
+/** The wait after `attempt` failed requests: exponential from the initial delay, then capped. */
 function retryDelay(attempt: number): number {
   const exponent = Math.min(attempt, 8);
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** exponent);
 }
 
+/** A contract error: the env spoke, and its answer ends the program instead of being retried. */
+class ContractError extends Error {}
+
 /**
- * POST the port the server bound until the env accepts it. 200 is the normal answer and 409 means
- * an earlier register already won; 400 and 405 are contract errors and end the program. A network
- * error or another status is retried, since the env may still be coming up.
+ * POST the port this program bound until the env accepts it. 200 is the ordinary answer, and 409
+ * means an earlier register already won, so both are done. 400 and 405 contradict the contract and
+ * end the program. A network error or any other status is retried, since the env may still be coming up.
  */
 async function register(port: number): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
@@ -59,7 +62,7 @@ async function register(port: number): Promise<void> {
   }
 }
 
-/** Poll GET /done until the env reports the trial is over. */
+/** Poll GET /done until the env reports that the trial is over. */
 async function waitForDone(): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
@@ -77,10 +80,7 @@ async function waitForDone(): Promise<void> {
   }
 }
 
-/** A contract error: the env spoke, and its answer ends the program rather than being retried. */
-class ContractError extends Error {}
-
-/** Bind the server on an ephemeral port, register it, and wait for the trial to end. */
+/** Bind the forge on an ephemeral port, register it with the env, and wait for the trial to end. */
 async function main(): Promise<void> {
   const server = createApp();
   await new Promise<void>((resolve, reject) => {

@@ -52,7 +52,8 @@ export function createApp(): Server {
         res.end();
         return;
       }
-      respond(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
+      const message = err instanceof Error ? err.message : 'Internal Server Error';
+      respond(res, 500, { message });
     });
   });
 }

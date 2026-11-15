@@ -1,6 +1,6 @@
 // store.ts: the forge's own store. Every repository keeps its git objects in an ObjectStore and
-// its metadata (issues, pull requests, labels) in one JSON file, so a restart loses nothing and
-// the trial's export can be rebuilt from it.
+// its metadata (issues, pull requests, labels) in one JSON file, so a restart loses nothing and the
+// trial's export can be rebuilt from what is on disk.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -78,7 +78,6 @@ export class Repo {
   readonly meta: RepoMeta;
   readonly store: ObjectStore;
   private readonly file: string;
-  private dirty = false;
 
   constructor(dir: string, meta: RepoMeta) {
     this.meta = meta;
@@ -86,12 +85,11 @@ export class Repo {
     this.store = new ObjectStore(join(dir, 'git'));
   }
 
-  /** Persist the metadata (cheap: the file is small and written atomically). */
+  /** Persist the metadata (cheap: the file is small, and it is written atomically). */
   save(): void {
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.meta));
     renameSync(tmp, this.file);
-    this.dirty = false;
   }
 
   /** The default branch's tip, or the zero id when the repository is unborn. */
@@ -124,11 +122,13 @@ export class Forge {
     mkdirSync(root, { recursive: true });
   }
 
-  /** Load every repository already on disk (a restart keeps everything). */
+  /** Load every repository already on disk, so a restart keeps everything. */
   load(): void {
     let entries: string[] = [];
     try {
-      entries = readdirSync(this.root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+      entries = readdirSync(this.root, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name);
     } catch {
       return;
     }
@@ -140,7 +140,7 @@ export class Forge {
         const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as RepoMeta;
         this.repos.set(`${meta.owner}/${meta.name}`.toLowerCase(), new Repo(dir, meta));
       } catch {
-        // a half-written repository is skipped rather than breaking the forge
+        // a half-written repository is skipped rather than breaking the whole forge
       }
     }
   }
@@ -150,15 +150,21 @@ export class Forge {
     return this.repos.get(`${owner}/${name}`.toLowerCase()) ?? null;
   }
 
-  /** Every repository, in creation order. */
+  /** Every repository, in creation order, optionally narrowed to one owner. */
   list(owner?: string): Repo[] {
     const all = [...this.repos.values()];
-    const filtered = owner ? all.filter((r) => r.meta.owner.toLowerCase() === owner.toLowerCase()) : all;
+    const filtered = owner
+      ? all.filter((r) => r.meta.owner.toLowerCase() === owner.toLowerCase())
+      : all;
     return filtered.sort((a, b) => (a.meta.created_at < b.meta.created_at ? -1 : 1));
   }
 
   /** Create one repository, answering it (or the existing one when the name is taken). */
-  create(owner: string, name: string, opts: { description?: string; private?: boolean; default_branch?: string } = {}): Repo {
+  create(
+    owner: string,
+    name: string,
+    opts: { description?: string; private?: boolean; default_branch?: string } = {},
+  ): Repo {
     const existing = this.get(owner, name);
     if (existing) return existing;
     const now = new Date().toISOString();

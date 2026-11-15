@@ -27,8 +27,11 @@ export function mergeViaMcp(repo: Repo, pr: Pull): string {
   const parents = baseTip ? [baseTip] : [];
   const now = new Date().toISOString();
   const sha = createCommit(repo.store, {
-    tree, parents, message: `${pr.title}\n\n#${pr.number}`,
-    name: repo.meta.owner, email: `${repo.meta.owner}@users.noreply.github.com`,
+    tree,
+    parents,
+    message: `${pr.title}\n\n#${pr.number}`,
+    name: repo.meta.owner,
+    email: `${repo.meta.owner}@users.noreply.github.com`,
   });
   repo.meta.branches[pr.base] = sha;
   pr.state = 'closed';
