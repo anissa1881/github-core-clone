@@ -12,3 +12,7 @@ dbg*.ts
 srv.ts
 *.out
 *.log
+t-git.ts
+t-gql.ts
+smoke*.ts
+dbg*.ts

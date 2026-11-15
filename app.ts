@@ -98,9 +98,13 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return;
   }
 
-  // GraphQL v4
+  // GraphQL v4: the token is required, and a query without one is 401
   if (path === '/api/graphql' || path === '/graphql') {
     if (method === 'POST') {
+      if (!authorized(req, f.token)) {
+        respond(res, 401, { message: 'Requires authentication' });
+        return;
+      }
       await handleGraphQL(f, req, res);
       return;
     }

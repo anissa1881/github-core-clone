@@ -3,7 +3,7 @@
 // side-band-64k. Everything is served from the ObjectStore: no git binary is involved.
 
 import type { ServerResponse } from 'node:http';
-import { FLUSH, decodePackets, pkt } from './pktline.ts';
+import { DELIM, FLUSH, decodePackets, pkt } from './pktline.ts';
 import {
   OBJ_COMMIT,
   OBJ_TREE,
@@ -285,6 +285,7 @@ function lsRefs(
 interface FetchWants {
   wants: string[];
   haves: string[];
+  shallow: string | null;
   deepen: number | null;
   done: boolean;
 }
@@ -294,14 +295,16 @@ function parseFetchArgs(args: ReadonlyArray<string>): FetchWants {
   const wants: string[] = [];
   const haves: string[] = [];
   let deepen: number | null = null;
+  let shallow: string | null = null;
   let done = false;
   for (const a of args) {
     if (a.startsWith('want ')) wants.push(a.slice(5).trim());
     else if (a.startsWith('have ')) haves.push(a.slice(5).trim());
+    else if (a.startsWith('shallow ')) shallow = a.slice(8).trim();
     else if (a.startsWith('deepen ')) deepen = Number(a.slice(7).trim());
     else if (a === 'done') done = true;
   }
-  return { wants, haves, deepen, done };
+  return { wants, haves, shallow, deepen, done };
 }
 
 /**
@@ -314,7 +317,13 @@ function buildFetchPack(store: ObjectStore, f: FetchWants): { pack: Buffer; shal
   let tips = f.wants.filter((w) => isOid(w));
   const shallow: string[] = [];
 
-  if (f.deepen !== null && f.deepen > 0) {
+  // a deepen of 2^31-1 is git's --unshallow: the whole history, with no boundary at all
+  const unbounded = f.deepen !== null && f.deepen >= 0x7fffffff;
+
+  if (f.deepen !== null && f.deepen > 0 && !unbounded) {
+    // a deepen from an already-shallow clone must still send the ancestors it is missing, so a
+    // commit the client already has may not be excluded as a boundary when it is an ancestor
+    exclude.clear();
     // Keep `deepen` generations of commits from each want. A commit at the boundary is sent, but
     // its parents are not: the client is told the boundary id as shallow, so it stops there.
     const kept = new Set<string>();
@@ -333,6 +342,12 @@ function buildFetchPack(store: ObjectStore, f: FetchWants): { pack: Buffer; shal
       for (const p of c.parents) queue.push({ oid: p, d: d + 1 });
     }
     tips = tips.filter((t) => kept.has(t));
+  }
+
+  if (unbounded) {
+    // nothing is a boundary, so every ancestor of every want is sent
+    exclude.clear();
+    tips = f.wants.filter((w) => isOid(w));
   }
 
   return { pack: writePack(reachableObjects(store, tips, exclude), store), shallow: [...new Set(shallow)] };
@@ -366,15 +381,43 @@ export function servicePost(
     return { body: lsRefs(store, refs, head, req.args), headers: resultHeaders('git-upload-pack') };
   }
   if (req.command === 'fetch') {
-    const { pack, shallow } = buildFetchPack(store, parseFetchArgs(req.args));
-    // v2 answers with named sections: shallow-info first (the boundary lines), then packfile,
-    // whose payload is the packfiledata section streamed on side-band channel 1
+    const asked = parseFetchArgs(req.args);
+    const { pack, shallow } = buildFetchPack(store, asked);
+
+    // v2 fetch answers in sections: acknowledgments (only when the client sent haves), then
+    // shallow-info inside that same section, then packfile whose payload rides side-band 1.
+    // A client that sent no haves gets no acknowledgments section at all.
     const parts: Buffer[] = [];
+
+    // v2 fetch sections, each closed by a delimiter (FLUSH), as gitprotocol-v2 defines them:
+    //   acknowledgments -> shallow-info -> packfile
+    // A client that sent haves always gets acknowledgments, with 'ready' closing it. The
+    // shallow-info section carries 'shallow' for a new boundary and 'unshallow' for a commit the
+    // client marked shallow that is no longer one, which is what --unshallow needs.
+    const deepening = asked.shallow !== null || asked.deepen !== null;
+
+    // gitprotocol-v2 sections are separated by a delim-pkt (0001); a flush-pkt (0000) ends the
+    // whole response. A fetch that sent haves opens with acknowledgments, which closes with
+    // 'ready'. Then shallow-info, then packfile.
+    if (asked.haves.length > 0) {
+      parts.push(pkt('acknowledgments\n'));
+      parts.push(pkt(`ACK ${asked.haves[asked.haves.length - 1]}\n`));
+      parts.push(pkt('ready\n'));
+      parts.push(DELIM);
+    }
+
     if (shallow.length > 0) {
       parts.push(pkt('shallow-info\n'));
       for (const s of shallow) parts.push(pkt(`shallow ${s}\n`));
-      parts.push(FLUSH);
+      parts.push(DELIM);
+    } else if (deepening) {
+      // a deepen that ends in no boundary unshallows what the client held, so the client stops
+      // treating those commits as shallow
+      parts.push(pkt('shallow-info\n'));
+      if (asked.shallow !== null) parts.push(pkt(`unshallow ${asked.shallow}\n`));
+      parts.push(DELIM);
     }
+
     parts.push(pkt('packfile\n'));
     parts.push(sideBand(pack));
     parts.push(FLUSH);
