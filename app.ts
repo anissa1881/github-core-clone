@@ -5,12 +5,21 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Forge } from './store.ts';
+import { Forge, type Repo } from './store.ts';
 import { handleRest } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { authorized, readRaw, respond } from './http.ts';
-import { advertiseRefs, infoRefs, parseSmartPath, servicePost, writeSmart, resultHeaders } from './git/http.ts';
+import {
+  advertiseRefs,
+  infoRefs,
+  parseSmartPath,
+  resultHeaders,
+  servicePost,
+  writeSmart,
+  type SmartTarget,
+} from './git/http.ts';
+import { ZERO_OID } from './git/objects.ts';
 
 /** The forge every request reads: created once per process. */
 let forge: Forge | null = null;
@@ -39,8 +48,12 @@ function forgeOf(): Forge {
 
 /** The base URL the suite uses, for the absolute links the API reports. */
 function baseOf(req: IncomingMessage): string {
-  const host = req.headers.host ?? 'localhost';
-  return `http://${host}`;
+  return `http://${req.headers.host ?? 'localhost'}`;
+}
+
+/** Answer one JSON 405 with an Allow header, for a path served by another method only. */
+function methodNotAllowed(res: ServerResponse, allow: string): void {
+  respond(res, 405, { message: 'Method Not Allowed' }, { allow });
 }
 
 /** Build the server. It binds nothing until main.ts listens on its ephemeral port. */
@@ -85,30 +98,28 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return;
   }
 
-  // GraphQL
+  // GraphQL v4
   if (path === '/api/graphql' || path === '/graphql') {
-    if (method === 'POST') { await handleGraphQL(f, req, res); return; }
-    res.writeHead(405, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ message: 'Method Not Allowed' }));
-    return;
-  }
-
-  // MCP
-  if (path === '/mcp' || path === '/mcp/') {
-    if (method === 'POST') { await handleMcp(f, req, res); return; }
-    if (method === 'GET') {
-      // the Streamable HTTP transport allows a GET for a server-initiated stream; this server
-      // sends nothing unprompted, so it answers an empty event stream and closes
-      res.writeHead(405, { 'content-type': 'application/json', allow: 'POST' });
-      res.end(JSON.stringify({ message: 'Method Not Allowed' }));
+    if (method === 'POST') {
+      await handleGraphQL(f, req, res);
       return;
     }
-    res.writeHead(405, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ message: 'Method Not Allowed' }));
+    methodNotAllowed(res, 'POST');
     return;
   }
 
-  // REST v3 (and everything else under /api/v3)
+  // MCP over Streamable HTTP
+  if (path === '/mcp' || path === '/mcp/') {
+    if (method === 'POST') {
+      await handleMcp(f, req, res);
+      return;
+    }
+    // this server sends nothing unprompted, so a GET stream is not offered
+    methodNotAllowed(res, 'POST');
+    return;
+  }
+
+  // REST v3, and everything else under /api/v3
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
     if (!authorized(req, f.token)) {
       respond(res, 401, { message: 'Requires authentication' });
@@ -131,22 +142,30 @@ async function handleSmart(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
-  target: NonNullable<ReturnType<typeof parseSmartPath>>,
+  target: SmartTarget,
 ): Promise<void> {
   const repo = f.get(target.owner, target.repo);
   if (!repo) {
-    // a missing repository is 404 on both services' info/refs, and the server stays up
-    writeSmart(res, 404, Buffer.from(JSON.stringify({ message: 'Not Found' })), { 'content-type': 'application/json' });
+    // a missing repository is 404 on both services, and the server stays up
+    writeSmart(res, 404, Buffer.from(`${JSON.stringify({ message: 'Not Found' })}\n`), {
+      'content-type': 'application/json',
+    });
     return;
   }
-  // git speaks with the same bearer token the suite presents
+
+  // git speaks with the same token the suite presents, as Basic or a bearer
   if (!authorized(req, f.token)) {
     res.writeHead(401, { 'content-type': 'text/plain', 'www-authenticate': 'Basic realm="GitHub"' });
     res.end('Unauthorized');
     return;
   }
+
   const refs = advertiseRefs(repo.store, new Map(Object.entries(repo.meta.branches)));
   const head = `refs/heads/${repo.meta.default_branch}`;
+  const wantsV2 = (req.headers['git-protocol'] ?? '')
+    .toString()
+    .split(':')
+    .some((part) => part.trim() === 'version=2');
 
   if (target.kind === 'info-refs') {
     const service = url.searchParams.get('service');
@@ -155,90 +174,44 @@ async function handleSmart(
       res.end('Dumb HTTP protocol is not supported\n');
       return;
     }
-    const v2 = (req.headers['git-protocol'] ?? '').toString().split(':').some((p) => p.trim() === 'version=2');
-    const answer = infoRefs(repo.store, refs, service, v2);
+    const answer = infoRefs(repo.store, refs, service, wantsV2);
     writeSmart(res, 200, answer.body, answer.headers);
     return;
   }
 
   const body = await readRaw(req);
-  const v2 = (req.headers['git-protocol'] ?? '').toString().split(':').some((p) => p.trim() === 'version=2');
-  const answer = servicePost(repo.store, refs, head, target.service, body, v2);
+  const answer = servicePost(repo.store, refs, head, target.service, body, wantsV2);
 
-  // a push moves the repository's branches
-  if (target.service === 'git-receive-pack') {
-    applyPush(repo, body);
+  // a push moves the repository's branches, but only the refs the protocol reported ok
+  if (target.service === 'git-receive-pack' && answer.applied) {
+    applyPush(repo, answer.applied);
   }
   void resultHeaders;
   writeSmart(res, 200, answer.body, answer.headers);
 }
 
-/**
- * Apply a push's ref updates to the repository's branch map. The protocol answer already refused
- * a non-fast-forward; only the refs it reported `ok` move.
- */
-function applyPush(repo: import('./store.ts').Repo, body: Buffer): void {
-  const updates = readPushCommands(body);
-  for (const u of updates) {
-    const m = /^refs\/heads\/(.+)$/.exec(u.ref);
+/** Move the repository's branch map to what a push's report said it accepted. */
+function applyPush(repo: Repo, applied: ReadonlyArray<{ ref: string; newOid: string }>): void {
+  let moved = false;
+  for (const update of applied) {
+    const m = /^refs\/heads\/(.+)$/.exec(update.ref);
     if (!m) continue;
     const branch = m[1]!;
-    if (u.newOid === '0'.repeat(40)) {
+    if (update.newOid === ZERO_OID) {
       delete repo.meta.branches[branch];
+      moved = true;
       continue;
     }
-    if (!repo.store.has(u.newOid)) continue;
-    const current = repo.meta.branches[branch];
-    if (current && current !== u.newOid && !isFastForward(repo, current, u.newOid)) continue;
-    repo.meta.branches[branch] = u.newOid;
-    repo.meta.updated_at = new Date().toISOString();
+    if (!repo.store.has(update.newOid)) continue;
+    repo.meta.branches[branch] = update.newOid;
+    moved = true;
   }
+  if (!moved) return;
+  repo.meta.updated_at = new Date().toISOString();
   repo.save();
 }
 
-/** Read the command block of a receive-pack body: "<old> <new> <ref>". */
-function readPushCommands(body: Buffer): Array<{ oldOid: string; newOid: string; ref: string }> {
-  const out: Array<{ oldOid: string; newOid: string; ref: string }> = [];
-  let off = 0;
-  while (off + 4 <= body.length) {
-    const header = body.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-f]{4}$/.test(header)) break;
-    const len = parseInt(header, 16);
-    if (len === 0) break;
-    if (len === 1 || len === 2) { off += 4; continue; }
-    const payload = body.subarray(off + 4, off + len);
-    const nul = payload.indexOf(0);
-    const line = (nul >= 0 ? payload.subarray(0, nul) : payload).toString('utf8').replace(/\n$/, '');
-    const parts = line.split(' ');
-    if (parts.length === 3 && /^[0-9a-f]{40}$/.test(parts[0]!) && /^[0-9a-f]{40}$/.test(parts[1]!) && parts[2]!.startsWith('refs/')) {
-      out.push({ oldOid: parts[0]!, newOid: parts[1]!, ref: parts[2]! });
-    }
-    off += len;
-  }
-  return out;
-}
-
-/** Whether `next` descends from `current` (the fast-forward test a push must pass). */
-function isFastForward(repo: import('./store.ts').Repo, current: string, next: string): boolean {
-  const seen = new Set<string>();
-  const queue = [next];
-  while (queue.length > 0) {
-    const oid = queue.shift()!;
-    if (oid === current) return true;
-    if (seen.has(oid)) continue;
-    seen.add(oid);
-    const o = repo.store.read(oid);
-    if (!o || o.type !== 1) continue;
-    const text = o.data.toString('utf8');
-    for (const line of text.split('\n')) {
-      if (line.startsWith('parent ')) queue.push(line.slice(7).trim());
-      if (line === '') break;
-    }
-  }
-  return false;
-}
-
-/** Hand the tests a forge bound to a fresh store in a directory they name. */
+/** Hand the tests a forge bound to a store in a directory they name. */
 export function freshForge(root: string, token: string, login: string): Forge {
   const f = new Forge(root, token, login);
   f.load();
