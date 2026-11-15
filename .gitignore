@@ -5,3 +5,10 @@ FILEMAP.md
 .env
 create.json
 refs.out
+sh.test.ts
+surfaces.ts
+gitroundtrip.ts
+dbg*.ts
+srv.ts
+*.out
+*.log

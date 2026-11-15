@@ -22,7 +22,9 @@ export type Packet =
 /** Frame one data packet around `payload` (a string is encoded as UTF-8). */
 export function pkt(payload: string | Buffer): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  if (data.length > PKT_LINE_MAX_PAYLOAD) throw new Error(`pkt-line payload ${data.length} over ${PKT_LINE_MAX_PAYLOAD}`);
+  if (data.length > PKT_LINE_MAX_PAYLOAD) {
+    throw new Error(`pkt-line payload ${data.length} over ${PKT_LINE_MAX_PAYLOAD}`);
+  }
   const header = Buffer.from((data.length + 4).toString(16).padStart(4, '0'), 'ascii');
   return Buffer.concat([header, data]);
 }
@@ -34,7 +36,7 @@ export const DELIM = Buffer.from('0001', 'ascii');
 /** The response-end-pkt: 0002. */
 export const RESPONSE_END = Buffer.from('0002', 'ascii');
 
-/** Frame a list of packets, each a string or a Buffer or one of the constants above. */
+/** Frame a list of packets, each a string, a Buffer, or one of the constants above. */
 export function pktLines(items: ReadonlyArray<string | Buffer>): Buffer {
   return Buffer.concat(items.map((item) => (Buffer.isBuffer(item) ? item : pkt(item))));
 }
@@ -48,46 +50,42 @@ export interface DecodedPacket {
 }
 
 /**
- * Decode every complete pkt-line in `buf`, stopping at the first incomplete one (`rest` holds the
- * bytes not consumed, so a streaming caller can prepend them to the next chunk).
+ * Decode the pkt-lines at the start of `buf`. Answers the packets read, how many bytes they used,
+ * and whether the buffer simply ran out (`incomplete`) rather than holding something that is not a
+ * pkt-line. A caller reading a stream keeps the remainder and tries again.
  */
-export function decodePktLines(buf: Buffer): { packets: DecodedPacket[]; rest: Buffer } {
+export function decodePackets(buf: Buffer): { packets: DecodedPacket[]; used: number; incomplete: boolean } {
   const packets: DecodedPacket[] = [];
   let off = 0;
   while (off + 4 <= buf.length) {
     const header = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) break;
-    const length = parseInt(header, 16);
-    if (length === 0) {
+    if (!/^[0-9a-fA-F]{4}$/.test(header)) return { packets, used: off, incomplete: false };
+    const len = parseInt(header, 16);
+    if (len === 0) {
       packets.push({ packet: { kind: 'flush' }, raw: buf.subarray(off, off + 4), text: '' });
       off += 4;
       continue;
     }
-    if (length === 1) {
+    if (len === 1) {
       packets.push({ packet: { kind: 'delim' }, raw: buf.subarray(off, off + 4), text: '' });
       off += 4;
       continue;
     }
-    if (length === 2) {
+    if (len === 2) {
       packets.push({ packet: { kind: 'response-end' }, raw: buf.subarray(off, off + 4), text: '' });
       off += 4;
       continue;
     }
-    if (length === 3) {
-      off += 4; // 0003 is invalid: git treats it as a no-op packet
-      continue;
-    }
-    if (off + length > buf.length) break; // incomplete: leave it buffered
-    const data = buf.subarray(off + 4, off + length);
-    packets.push({ packet: { kind: 'data', data }, raw: buf.subarray(off, off + length), text: data.toString('utf8') });
-    off += length;
+    if (len < 4) return { packets, used: off, incomplete: false };
+    if (off + len > buf.length) return { packets, used: off, incomplete: true };
+    const data = buf.subarray(off + 4, off + len);
+    packets.push({ packet: { kind: 'data', data }, raw: buf.subarray(off, off + len), text: data.toString('utf8') });
+    off += len;
   }
-  return { packets, rest: buf.subarray(off) };
+  return { packets, used: off, incomplete: off < buf.length };
 }
 
-/** Decode a whole buffer that must be well formed; throws when a packet runs past the end. */
-export function decodeAll(buf: Buffer): DecodedPacket[] {
-  const { packets, rest } = decodePktLines(buf);
-  if (rest.length > 0) throw new Error(`truncated pkt-line: ${rest.length} trailing byte(s)`);
-  return packets;
+/** The data payloads of the packets, as text lines (special packets dropped). */
+export function dataLines(packets: ReadonlyArray<DecodedPacket>): string[] {
+  return packets.filter((p) => p.packet.kind === 'data').map((p) => p.text.replace(/\n$/, ''));
 }

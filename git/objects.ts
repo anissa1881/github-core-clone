@@ -15,28 +15,6 @@ export const OBJ_TAG = 4;
 export const OBJ_OFS_DELTA = 6;
 export const OBJ_REF_DELTA = 7;
 
-/** A type number's name, as "<type> <size>\0" writes it. */
-export function typeName(type: number): string {
-  switch (type) {
-    case OBJ_COMMIT: return 'commit';
-    case OBJ_TREE: return 'tree';
-    case OBJ_BLOB: return 'blob';
-    case OBJ_TAG: return 'tag';
-    default: throw new Error(`unknown object type ${type}`);
-  }
-}
-
-/** The type number a name means; throws on anything else. */
-export function typeNumber(name: string): number {
-  switch (name) {
-    case 'commit': return OBJ_COMMIT;
-    case 'tree': return OBJ_TREE;
-    case 'blob': return OBJ_BLOB;
-    case 'tag': return OBJ_TAG;
-    default: throw new Error(`unknown object type ${JSON.stringify(name)}`);
-  }
-}
-
 /** The all-zero object id: an unborn branch's old and new value. */
 export const ZERO_OID = '0'.repeat(40);
 
@@ -44,6 +22,38 @@ export const ZERO_OID = '0'.repeat(40);
 export interface GitObject {
   type: number;
   data: Buffer;
+}
+
+/** A type number's name, as "<type> <size>\0" writes it. */
+export function typeName(type: number): string {
+  switch (type) {
+    case OBJ_COMMIT:
+      return 'commit';
+    case OBJ_TREE:
+      return 'tree';
+    case OBJ_BLOB:
+      return 'blob';
+    case OBJ_TAG:
+      return 'tag';
+    default:
+      throw new Error(`unknown object type ${type}`);
+  }
+}
+
+/** The type number a name means; throws on anything else. */
+export function typeNumber(name: string): number {
+  switch (name) {
+    case 'commit':
+      return OBJ_COMMIT;
+    case 'tree':
+      return OBJ_TREE;
+    case 'blob':
+      return OBJ_BLOB;
+    case 'tag':
+      return OBJ_TAG;
+    default:
+      throw new Error(`unknown object type ${JSON.stringify(name)}`);
+  }
 }
 
 /** The sha1 git gives an object: sha1("<type> <size>\0" + content). */
@@ -63,6 +73,7 @@ function parseRaw(raw: Buffer): GitObject {
   if (nul < 0) throw new Error('object header has no NUL');
   const header = raw.subarray(0, nul).toString('utf8');
   const space = header.indexOf(' ');
+  if (space < 0) throw new Error('object header has no space');
   const type = typeNumber(header.slice(0, space));
   const size = Number(header.slice(space + 1));
   const data = raw.subarray(nul + 1);
@@ -88,19 +99,20 @@ function readVarint(buf: Buffer, start: number): { value: number; next: number }
 
 /** Apply a git delta to its base, returning the result. */
 export function applyDelta(base: Buffer, delta: Buffer): Buffer {
-  let off = 0;
-  const baseSize = readVarint(delta, off);
-  if (baseSize.value !== base.length) throw new Error(`delta base size ${baseSize.value} is not the base's ${base.length}`);
-  off = baseSize.next;
-  const resultSize = readVarint(delta, off);
-  off = resultSize.next;
+  const baseSize = readVarint(delta, 0);
+  if (baseSize.value !== base.length) {
+    throw new Error(`delta base size ${baseSize.value} is not the base's ${base.length}`);
+  }
+  const resultSize = readVarint(delta, baseSize.next);
+  let off = resultSize.next;
   const out = Buffer.allocUnsafe(resultSize.value);
   let written = 0;
+
   while (off < delta.length) {
     const op = delta[off];
     off += 1;
     if (op & 0x80) {
-      // copy from base: the low bits name which offset and size bytes follow
+      // copy from the base: the low bits name which offset and size bytes follow
       let cpOff = 0;
       let cpSize = 0;
       if (op & 0x01) { cpOff |= delta[off]; off += 1; }
@@ -115,7 +127,7 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
       base.copy(out, written, cpOff, cpOff + cpSize);
       written += cpSize;
     } else if (op > 0) {
-      // insert op literal bytes from the delta
+      // insert this many literal bytes taken from the delta itself
       if (off + op > delta.length) throw new Error('delta insert past its end');
       delta.copy(out, written, off, off + op);
       off += op;
@@ -124,19 +136,61 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
       throw new Error('delta reserved opcode 0');
     }
   }
+
   if (written !== resultSize.value) throw new Error(`delta wrote ${written} of ${resultSize.value} bytes`);
   return out;
 }
 
-/** One object as a packfile entry: its type, its inflated content, and its delta base link. */
+/** One object as a packfile entry, before its delta is resolved. */
 interface PackEntry {
   type: number;
   data: Buffer;
-  /** For a delta entry: the base this entry was packed against. */
+  /** For an OFS_DELTA: where its base starts in this pack. */
   baseOffset?: number;
+  /** For a REF_DELTA: the base's id (a thin pack's may lie outside this pack). */
   baseOid?: string;
   /** Where this entry starts in the pack. */
   offset: number;
+}
+
+/** Inflate the one zlib stream starting at `start`, answering its bytes and where it ended. */
+export function inflateOne(buf: Buffer, start: number): { data: Buffer; next: number } {
+  // A zlib stream has no length prefix, so grow the slice until inflate succeeds, then bisect on
+  // the first prefix that yields a complete stream to learn exactly how many bytes it occupied.
+  let end = Math.min(buf.length, start + 512);
+  for (;;) {
+    try {
+      const data = inflateSync(buf.subarray(start, end));
+      return { data, next: start + zlibConsumed(buf, start, end) };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '';
+      const code = (err as NodeJS.ErrnoException).code;
+      const short = code === 'Z_BUF_ERROR' || message.includes('unexpected end') || message.includes('buffer');
+      if (!short) throw err;
+      if (end >= buf.length) throw new Error('truncated zlib stream in pack');
+      end = Math.min(buf.length, end * 2);
+    }
+  }
+}
+
+/** How many bytes of `buf` from `start` one zlib stream occupies (the first prefix that inflates). */
+function zlibConsumed(buf: Buffer, start: number, end: number): number {
+  let lo = 2;
+  let hi = end - start;
+  const complete = (n: number): boolean => {
+    try {
+      inflateSync(buf.subarray(start, start + n));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (complete(mid)) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
 }
 
 /**
@@ -152,16 +206,15 @@ export function readPack(pack: Buffer, external?: ReadonlyMap<string, GitObject>
   const count = pack.readUInt32BE(8);
   if (count > 2_000_000) throw new Error(`pack claims ${count} objects`);
 
-  const entries: PackEntry[] = [];
-  const byOffset = new Map<number, PackEntry>();
   const out = new Map<string, GitObject>();
-  const oidOf = new Map<PackEntry, string>();
+  const resolvedAt = new Map<number, GitObject>();
   let off = 12;
 
   for (let i = 0; i < count; i += 1) {
     const start = off;
     if (off >= pack.length) throw new Error(`pack ends before object ${i}`);
-    let byte = pack[off];
+
+    let byte = pack[off]!;
     off += 1;
     const type = (byte >> 4) & 0x07;
     let size = byte & 0x0f;
@@ -173,120 +226,54 @@ export function readPack(pack: Buffer, external?: ReadonlyMap<string, GitObject>
       size += (byte & 0x7f) * 2 ** shift;
       shift += 7;
     }
-    const entry: PackEntry = { type, data: Buffer.alloc(0), offset: start };
+
+    let baseOffset: number | undefined;
+    let baseOid: string | undefined;
     if (type === OBJ_OFS_DELTA) {
-      // negative offset to the base, in git's variable-length encoding
-      let byte2 = pack[off];
+      // a negative distance to the base, in git's own variable-length encoding
+      let next = pack[off];
+      if (next === undefined) throw new Error('truncated ofs-delta offset');
       off += 1;
-      let rel = byte2 & 0x7f;
-      while (byte2 & 0x80) {
-        byte2 = pack[off];
-        if (byte2 === undefined) throw new Error('truncated ofs-delta offset');
+      let distance = next & 0x7f;
+      while (next & 0x80) {
+        next = pack[off];
+        if (next === undefined) throw new Error('truncated ofs-delta offset');
         off += 1;
-        rel = ((rel + 1) * 128) + (byte2 & 0x7f);
+        distance = (distance + 1) * 128 + (next & 0x7f);
       }
-      entry.baseOffset = start - rel;
-      if (!byOffset.has(entry.baseOffset)) throw new Error(`ofs-delta base at ${entry.baseOffset} not in pack`);
+      baseOffset = start - distance;
+      if (!resolvedAt.has(baseOffset) && baseOffset < 0) throw new Error('ofs-delta base before the pack');
     } else if (type === OBJ_REF_DELTA) {
-      entry.baseOid = pack.subarray(off, off + 20).toString('hex');
+      baseOid = pack.subarray(off, off + 20).toString('hex');
       off += 20;
     } else if (type !== OBJ_COMMIT && type !== OBJ_TREE && type !== OBJ_BLOB && type !== OBJ_TAG) {
       throw new Error(`unknown pack object type ${type}`);
     }
 
-    // the payload is one zlib stream; inflate it without consuming the next entry's bytes
     const inflated = inflateOne(pack, off);
     off = inflated.next;
-    if (inflated.data.length !== size) throw new Error(`object ${i} inflated to ${inflated.data.length}, the header said ${size}`);
-    entry.data = inflated.data;
-    entries.push(entry);
-    byOffset.set(start, entry);
+    if (inflated.data.length !== size) {
+      throw new Error(`object ${i} inflated to ${inflated.data.length}, the header said ${size}`);
+    }
 
-    // resolve now: a delta needs its base, which is always earlier or already seen
     let resolved: GitObject;
     if (type === OBJ_OFS_DELTA) {
-      const base = resolveEntry(entry.baseOffset!);
-      resolved = { type: base.type, data: applyDelta(base.data, entry.data) };
+      const base = resolvedAt.get(baseOffset!);
+      if (!base) throw new Error(`ofs-delta base at ${baseOffset} not resolved earlier in the pack`);
+      resolved = { type: base.type, data: applyDelta(base.data, inflated.data) };
     } else if (type === OBJ_REF_DELTA) {
-      const base = resolveOid(entry.baseOid!);
-      resolved = { type: base.type, data: applyDelta(base.data, entry.data) };
+      const base = out.get(baseOid!) ?? external?.get(baseOid!);
+      if (!base) throw new Error(`ref-delta base ${baseOid} is not in the pack`);
+      resolved = { type: base.type, data: applyDelta(base.data, inflated.data) };
     } else {
-      resolved = { type, data: entry.data };
+      resolved = { type, data: inflated.data };
     }
-    entry.data = resolved.data;
-    entry.type = resolved.type;
-    const oid = hashObject(resolved.type, resolved.data);
-    oidOf.set(entry, oid);
-    out.set(oid, resolved);
+
+    resolvedAt.set(start, resolved);
+    out.set(hashObject(resolved.type, resolved.data), resolved);
   }
 
   return out;
-
-  function resolveEntry(offset: number): GitObject {
-    const e = byOffset.get(offset);
-    if (!e) throw new Error(`delta base at offset ${offset} not found`);
-    // an entry's data is its resolved content once it has been processed
-    const oid = oidOf.get(e);
-    if (oid) {
-      const found = out.get(oid);
-      if (found) return found;
-    }
-    if (e.type === OBJ_OFS_DELTA || e.type === OBJ_REF_DELTA) throw new Error('delta base is itself unresolved');
-    return { type: e.type, data: e.data };
-  }
-
-  function resolveOid(oid: string): GitObject {
-    const found = out.get(oid) ?? external?.get(oid);
-    if (!found) throw new Error(`ref-delta base ${oid} is not in the pack`);
-    return found;
-  }
-}
-
-/** Inflate the one zlib stream starting at `start`, answering its bytes and where it ended. */
-export function inflateOne(buf: Buffer, start: number): { data: Buffer; next: number } {
-  // zlib streams end at a 4-byte adler32; inflate with a growing tail so an entry's compressed
-  // bytes can be located exactly. Sync inflation reports how much it consumed.
-  const chunkEnd = Math.min(buf.length, start + 512);
-  let end = chunkEnd;
-  for (;;) {
-    try {
-      const data = inflateSync(buf.subarray(start, end), { finishFlush: 2 });
-      // find the true consumed length by re-inflating with the zlib header accounting
-      const consumed = zlibConsumed(buf, start, end);
-      return { data, next: start + consumed };
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException & { code?: string };
-      if (e.code === 'Z_BUF_ERROR' || (e as { errno?: number }).errno === -5 || e.message.includes('unexpected end')) {
-        if (end >= buf.length) throw new Error('truncated zlib stream in pack');
-        end = Math.min(buf.length, end * 2);
-        continue;
-      }
-      throw err;
-    }
-  }
-}
-
-/**
- * How many bytes of `buf` from `start` one zlib stream occupies: inflate progressively and bisect
- * on the first prefix that yields a complete stream.
- */
-function zlibConsumed(buf: Buffer, start: number, end: number): number {
-  let lo = 2;
-  let hi = end - start;
-  const fits = (n: number): boolean => {
-    try {
-      inflateSync(buf.subarray(start, start + n));
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  while (lo < hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    if (fits(mid)) hi = mid;
-    else lo = mid + 1;
-  }
-  return lo;
 }
 
 /** The on-disk store for one repository: loose objects and refs under its directory. */
@@ -304,25 +291,31 @@ export class ObjectStore {
     return join(this.dir, 'objects', oid.slice(0, 2), oid.slice(2));
   }
 
+  /** Whether the store holds this object. */
   has(oid: string): boolean {
     return existsSync(this.loosePath(oid));
   }
 
+  /** Read one object, or null when it is absent. */
   read(oid: string): GitObject | null {
     const path = this.loosePath(oid);
     if (!existsSync(path)) return null;
     return parseRaw(inflateSync(readFileSync(path)));
   }
 
-  /** Write one object, answering its id; writing an object twice is harmless. */
+  /** Write one object, answering its id; writing the same object twice is harmless. */
   write(type: number, data: Buffer): string {
     const oid = hashObject(type, data);
-    const path = this.loosePath(oid);
-    if (!existsSync(path)) {
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, deflateSync(rawObject({ type, data }), { level: 1 }));
-    }
+    this.store(oid, { type, data });
     return oid;
+  }
+
+  /** Write one already-hashed object unless it is on disk. */
+  private store(oid: string, o: GitObject): void {
+    const path = this.loosePath(oid);
+    if (existsSync(path)) return;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, deflateSync(rawObject(o), { level: 1 }));
   }
 
   /** Write every object of a parsed pack, answering their ids. */
@@ -330,20 +323,17 @@ export class ObjectStore {
     const objects = readPack(pack, this.allLoose());
     const ids: string[] = [];
     for (const [oid, o] of objects) {
-      const path = this.loosePath(oid);
-      if (!existsSync(path)) {
-        mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(path, deflateSync(rawObject(o), { level: 1 }));
-      }
+      this.store(oid, o);
       ids.push(oid);
     }
     return ids;
   }
 
   /** Every loose object, for a thin pack's external delta bases. */
-  allObjects(): Map<string, GitObject> { return this.allLoose(); }
+  allObjects(): Map<string, GitObject> {
+    return this.allLoose();
+  }
 
-  /** Every loose object, for a thin pack's external delta bases. */
   private allLoose(): Map<string, GitObject> {
     const all = new Map<string, GitObject>();
     const root = join(this.dir, 'objects');
@@ -384,11 +374,11 @@ function packEntry(type: number, data: Buffer): Buffer {
   return Buffer.concat([Buffer.from(head), deflateSync(data, { level: 1 })]);
 }
 
-/** Build a packfile from objects already in `objects` order (no deltas), with its trailer. */
+/** Build a packfile from objects already in the store (no deltas), with its trailer. */
 export function writePack(oids: ReadonlyArray<string>, store: ObjectStore): Buffer {
   const parts: Buffer[] = [Buffer.from('PACK'), Buffer.alloc(4), Buffer.alloc(4)];
-  parts[1].writeUInt32BE(2);
-  parts[2].writeUInt32BE(oids.length);
+  parts[1]!.writeUInt32BE(2);
+  parts[2]!.writeUInt32BE(oids.length);
   for (const oid of oids) {
     const o = store.read(oid);
     if (!o) throw new Error(`pack wants object ${oid}, which the store does not hold`);

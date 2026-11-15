@@ -14,7 +14,7 @@ const RETRY_INITIAL_MS = 250;
 /** The longest wait between retries. */
 const RETRY_MAX_MS = 2_000;
 
-/** The env's origin with any trailing slashes removed. */
+/** The env's origin with any trailing slashes removed, or '' when it was not given. */
 function readEnvUrl(): string {
   const raw = process.env.MAKEFUN_ENV_URL ?? '';
   return raw.replace(/\/+$/, '');
@@ -97,7 +97,7 @@ async function main(): Promise<void> {
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
-  server.close();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
   process.stdout.write('[entry] done\n');
 }
 
