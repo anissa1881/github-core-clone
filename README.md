@@ -1,11 +1,15 @@
 # github-core-clone
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/anissa1881/github-core-clone/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/anissa1881/github-core-clone/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 A standalone, GitHub-compatible git forge served by one process from its own store: git smart
 HTTP (upload-pack protocol v2 for clone and fetch, receive-pack v0 for push), the REST v3 API,
 GraphQL v4 and a Model Context Protocol endpoint at `/mcp`. No UI, no outside service, no git
 binary, and only Node's standard library.
 
-Entry for make.fun's `github-core-clone-01` bounty.
+Entry for [make.fun's Build a GitHub-compatible git forge bounty](https://make.fun/bounty/github-core-clone-01), $500 in USDC.
 
 ## Layout
 
