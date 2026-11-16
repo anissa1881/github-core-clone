@@ -1,6 +1,6 @@
 // graphql.ts: the GraphQL v4 surface. It parses the documents gh and github-mcp-server send
-// rather than shipping a schema library: a small tokenizer, a selection-set evaluator, and a
-// hand-written schema description that introspection answers.
+// rather than shipping a schema library: a small tokenizer, a recursive-descent parser, a
+// selection-set evaluator, and a hand-written schema description that introspection answers.
 
 import { OBJ_BLOB } from './git/objects.ts';
 import { diffTrees, readCommit, walkHistory } from './git/model.ts';
@@ -10,18 +10,21 @@ import { hashId } from './rest.ts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 // ---------------------------------------------------------------------------------------------
-// A minimal GraphQL document parser: enough for the operation documents the suite sends.
+// Lexing
 // ---------------------------------------------------------------------------------------------
 
 /** One lexical token: punctuation, a name, a string, a number, or the end of the document. */
 type Token = { kind: 'punct' | 'name' | 'string' | 'number' | 'eof'; value: string };
 
-/** The characters that act as single-character punctuation in a GraphQL document. */
-const PUNCT = new Set(['{', '}', '(', ')', ':', ',', '[', ']', '!', '=', '@', '|', '&', '$']);
+/** The characters that stand alone as punctuation in a GraphQL document. */
+const PUNCT = new Set(['{', '}', '(', ')', ':', ',', '[', ']', '!', '=', '@', '|', '&', '$', '...']);
+
+/** Whether a character may begin or continue a GraphQL name. */
+const isNameChar = (ch: string): boolean => /[A-Za-z0-9_]/.test(ch);
 
 /**
- * Split a document into tokens, skipping whitespace, commas and comments. A string literal is
- * read whole, with its backslash escapes decoded; a block string ("""...""") keeps its text.
+ * Split a document into tokens, skipping whitespace, commas and comments. String literals are
+ * read whole, their backslash escapes decoded; a block string keeps its text verbatim.
  */
 function tokenize(src: string): Token[] {
   const out: Token[] = [];
@@ -30,9 +33,16 @@ function tokenize(src: string): Token[] {
   while (i < src.length) {
     const ch = src[i]!;
 
-    // whitespace and commas are insignificant between tokens
+    // whitespace and commas carry no meaning between tokens
     if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === ',') {
       i += 1;
+      continue;
+    }
+
+    // a spread's three dots are one token; anywhere else a dot is an error
+    if (src.startsWith('...', i)) {
+      out.push({ kind: 'punct', value: '...' });
+      i += 3;
       continue;
     }
 
@@ -42,7 +52,7 @@ function tokenize(src: string): Token[] {
       continue;
     }
 
-    // a block string keeps its raw text, including newlines
+    // a block string keeps its raw text, newlines included
     if (src.startsWith('"""', i)) {
       const end = src.indexOf('"""', i + 3);
       const stop = end < 0 ? src.length : end;
@@ -51,64 +61,79 @@ function tokenize(src: string): Token[] {
       continue;
     }
 
-    // a quoted string, with its escapes decoded
+    // a quoted string, its escapes decoded
     if (ch === '"') {
       let j = i + 1;
       let value = '';
       while (j < src.length && src[j] !== '"') {
         if (src[j] === '\\' && j + 1 < src.length) {
           const esc = src[j + 1]!;
-          value += esc === 'n' ? '\n' : esc === 't' ? '\t' : esc === 'r' ? '\r' : esc;
+          const simple: Record<string, string> = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', '"': '"', '\\': '\\', '/': '/' };
+          if (esc === 'u' && j + 5 < src.length) {
+            // a four-digit \uXXXX escape
+            value += String.fromCharCode(parseInt(src.slice(j + 2, j + 6), 16));
+            j += 6;
+            continue;
+          }
+          value += simple[esc] ?? esc;
           j += 2;
           continue;
         }
         value += src[j];
         j += 1;
       }
+      if (j >= src.length) throw new GraphQLError('Syntax Error: Unterminated string.');
       out.push({ kind: 'string', value });
       i = j + 1;
       continue;
     }
 
-    // a number, with an optional fraction and exponent
-    if (/[0-9]/.test(ch) || (ch === '-' && /[0-9]/.test(src[i + 1] ?? ''))) {
-      let j = i + 1;
-      while (j < src.length && /[0-9.eE+-]/.test(src[j]!)) j += 1;
-      out.push({ kind: 'number', value: src.slice(i, j) });
-      i = j;
-      continue;
-    }
-
-    // a name: letters, digits and underscores, never starting with a digit
-    if (/[A-Za-z_]/.test(ch)) {
-      let j = i + 1;
-      while (j < src.length && /[A-Za-z0-9_]/.test(src[j]!)) j += 1;
-      out.push({ kind: 'name', value: src.slice(i, j) });
-      i = j;
-      continue;
-    }
-
-    // a spread's three dots are one token, so a selection can tell "...F" from a field named F
-    if (src.startsWith('...', i)) {
-      out.push({ kind: 'punct', value: '...' });
-      i += 3;
-      continue;
-    }
-
-    // anything else is one punctuation character
+    // punctuation stands alone
     if (PUNCT.has(ch)) {
       out.push({ kind: 'punct', value: ch });
       i += 1;
       continue;
     }
 
-    // an unrecognised character is skipped rather than failing the whole document
-    i += 1;
+    // a number: an optional sign, then digits with an optional fraction and exponent
+    if (ch === '-' || /[0-9]/.test(ch)) {
+      let j = i;
+      if (src[j] === '-') j += 1;
+      while (j < src.length && /[0-9]/.test(src[j]!)) j += 1;
+      if (src[j] === '.') {
+        j += 1;
+        while (j < src.length && /[0-9]/.test(src[j]!)) j += 1;
+      }
+      if (src[j] === 'e' || src[j] === 'E') {
+        j += 1;
+        if (src[j] === '+' || src[j] === '-') j += 1;
+        while (j < src.length && /[0-9]/.test(src[j]!)) j += 1;
+      }
+      out.push({ kind: 'number', value: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+
+    // anything else that looks like a name
+    if (isNameChar(ch)) {
+      let j = i;
+      while (j < src.length && isNameChar(src[j]!)) j += 1;
+      out.push({ kind: 'name', value: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+
+    // a character the grammar has no place for
+    throw new GraphQLError(`Syntax Error: Unexpected character ${JSON.stringify(ch)}.`);
   }
 
   out.push({ kind: 'eof', value: '' });
   return out;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The document model
+// ---------------------------------------------------------------------------------------------
 
 /** One field selection: its name, alias, arguments and sub-selections. */
 interface Selection {
@@ -145,8 +170,8 @@ interface Document {
 }
 
 /**
- * The parser's own error, carrying the GraphQL error entry a request answers with. A document
- * that cannot be read is a 200 with an errors array, as GitHub answers it.
+ * The parser's own error. A document that cannot be read is answered as a 200 with an errors
+ * array, the way GitHub answers one.
  */
 export class GraphQLError extends Error {
   readonly locations?: Array<{ line: number; column: number }>;
@@ -167,7 +192,7 @@ class Cursor {
     this.tokens = tokens;
   }
 
-  /** The token under the cursor. */
+  /** The token under the cursor, or one of the tokens just after it. */
   peek(offset = 0): Token {
     return this.tokens[Math.min(this.pos + offset, this.tokens.length - 1)]!;
   }
@@ -216,6 +241,21 @@ function parseValue(c: Cursor): unknown {
     c.next();
     return { $var: c.name() };
   }
+  if (t.kind === 'string') {
+    c.next();
+    return t.value;
+  }
+  if (t.kind === 'number') {
+    c.next();
+    return Number(t.value);
+  }
+  if (t.kind === 'name') {
+    c.next();
+    if (t.value === 'true') return true;
+    if (t.value === 'false') return false;
+    if (t.value === 'null') return null;
+    return t.value;
+  }
   if (t.kind === 'punct' && t.value === '[') {
     c.next();
     const list: unknown[] = [];
@@ -238,42 +278,25 @@ function parseValue(c: Cursor): unknown {
     c.expect('}');
     return obj;
   }
-  if (t.kind === 'string') {
-    c.next();
-    return t.value;
-  }
-  if (t.kind === 'number') {
-    c.next();
-    return Number(t.value);
-  }
-  if (t.kind === 'name') {
-    c.next();
-    if (t.value === 'true') return true;
-    if (t.value === 'false') return false;
-    if (t.value === 'null') return null;
-    // an unquoted name used as a value is an enum
-    return t.value;
-  }
-
-  throw new GraphQLError(`Syntax Error: Unexpected ${JSON.stringify(t.value)}.`);
+  throw new GraphQLError(`Syntax Error: Unexpected token ${JSON.stringify(t.value)}.`);
 }
 
-/** Parse a parenthesised argument list, or answer an empty object when there is none. */
+/** Parse an argument list, answering it as a record (empty when the field takes none). */
 function parseArgs(c: Cursor): Record<string, unknown> {
-  const args: Record<string, unknown> = {};
-  if (!c.at('(')) return args;
+  const out: Record<string, unknown> = {};
+  if (!c.at('(')) return out;
   c.expect('(');
   while (!c.at(')')) {
     if (c.done()) throw new GraphQLError('Syntax Error: Unterminated argument list.');
     const name = c.name();
     c.expect(':');
-    args[name] = parseValue(c);
+    out[name] = parseValue(c);
   }
   c.expect(')');
-  return args;
+  return out;
 }
 
-/** Parse a directive list, or answer an empty array when there is none. */
+/** Read any directives attached to a field or fragment spread. */
 function parseDirectives(c: Cursor): Array<{ name: string; args: Record<string, unknown> }> {
   const out: Array<{ name: string; args: Record<string, unknown> }> = [];
   while (c.at('@')) {
@@ -307,15 +330,14 @@ function parseSelectionSet(c: Cursor): Selection[] {
       const nested = c.at('{') ? parseSelectionSet(c) : [];
 
       // an inline fragment carries its own selections; a named spread is resolved by the caller
-      const spread: Selection = {
+      out.push({
         name: name ?? '__inline',
         alias: null,
         args: on === null ? {} : { __on: on },
         selections: nested,
         fragments: name === null ? [] : [name],
         directives,
-      };
-      out.push(spread);
+      });
       continue;
     }
 
@@ -337,7 +359,7 @@ function parseSelectionSet(c: Cursor): Selection[] {
   return out;
 }
 
-/** Parse a fragment definition, answering its name and body. */
+/** Parse a fragment definition, answering its name, type condition and body. */
 function parseFragment(c: Cursor): Fragment {
   c.expect('fragment');
   const name = c.name();
@@ -351,7 +373,7 @@ function parseFragment(c: Cursor): Fragment {
 }
 
 /**
- * Parse a document into its operations, keeping its fragments so a spread can be resolved later.
+ * Parse a whole document: its operations and every fragment it defines.
  * Throws a GraphQLError when the document cannot be read.
  */
 function parseDocument(src: string): Document {
@@ -380,8 +402,8 @@ function parseDocument(src: string): Document {
 }
 
 /**
- * Read the rest of an operation whose keyword (if any) was already consumed. `word` is that
- * keyword, or an empty string for a bare selection set.
+ * Read the rest of an operation whose keyword (if any) was already consumed. `keyword` is that
+ * keyword, or null for a bare selection set.
  */
 function parseOperation(c: Cursor, keyword: string | null): Operation {
   const kind: Operation['kind'] = (keyword as Operation['kind'] | null) ?? 'query';
@@ -454,7 +476,6 @@ interface FieldDef {
   args?: Record<string, string>;
 }
 
-/** One type reference as introspection reports it: a named type, a list, or a non-null wrapper. */
 function typeRef(t: string): Record<string, unknown> {
   let text = t.trim();
 
@@ -1189,22 +1210,35 @@ function introspection(selections: Selection[], vars: Record<string, unknown>, f
 }
 
 /** Answer one GraphQL request body. */
+
+/** One error entry in the shape a GraphQL response carries it. */
+function errorEntry(message: string, path?: Array<string | number>): Record<string, unknown> {
+  return { message, locations: [], path: path ?? [] };
+}
+
+/**
+ * Answer one GraphQL request body. A document that cannot be parsed, or a field that throws,
+ * answers 200 with an errors array, the way GitHub answers one; a field that throws nulls only
+ * its own key, never the whole response.
+ */
 async function answerOne(forge: Forge, body: Record<string, unknown>): Promise<Record<string, unknown>> {
   const source = typeof body.query === 'string' ? body.query : '';
-  const provided = body.variables !== null && typeof body.variables === 'object' ? (body.variables as Record<string, unknown>) : {};
+  const provided = body.variables !== null && typeof body.variables === 'object' && !Array.isArray(body.variables)
+    ? (body.variables as Record<string, unknown>)
+    : {};
 
   if (source.trim() === '') {
-    return { errors: [{ message: 'A query string is required.', locations: [], path: [] }] };
+    return { errors: [errorEntry('A query string is required.')] };
   }
 
   let doc: Document;
   try {
     doc = parseDocument(source);
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Syntax Error.';
-    return { errors: [{ message }] };
+    return { errors: [errorEntry(err instanceof Error ? err.message : 'Syntax Error.')] };
   }
 
+  // a subscription has nothing to stream here; the first query or mutation is what runs
   const visible = doc.operations.find((o) => o.kind !== 'subscription') ?? doc.operations[0]!;
 
   // a variable's default fills in for anything the caller did not send
@@ -1214,30 +1248,46 @@ async function answerOne(forge: Forge, body: Record<string, unknown>): Promise<R
   }
 
   const ctx: RequestContext = { forge, vars, frags: doc.fragments };
+  const errors: Array<Record<string, unknown>> = [];
+  const data: Record<string, unknown> = {};
 
+  let fields: Selection[];
   try {
-    const fields = expand(visible.selections, doc.fragments, vars);
-    const root = visible.kind === 'mutation' ? await mutationRoot(ctx, fields) : queryRoot(ctx, fields);
-    const data: Record<string, unknown> = {};
+    fields = expand(visible.selections, doc.fragments, vars);
+  } catch (err) {
+    return { errors: [errorEntry(err instanceof Error ? err.message : 'Internal error.')], data: null };
+  }
 
-    for (const sel of fields) {
-      const key = sel.alias ?? sel.name;
+  let root: Record<string, unknown>;
+  try {
+    root = visible.kind === 'mutation' ? await mutationRoot(ctx, fields) : queryRoot(ctx, fields);
+  } catch (err) {
+    errors.push(errorEntry(err instanceof Error ? err.message : 'Internal error.'));
+    root = {};
+  }
 
+  for (const sel of fields) {
+    const key = sel.alias ?? sel.name;
+    try {
       // an introspection field answers from the schema, under whatever alias it was asked for
       if (sel.name === '__type' || sel.name === '__schema' || sel.name === '__typename') {
         const answered = introspection([sel], vars, doc.fragments);
-        data[key] = sel.selections.length === 0 ? answered[sel.name] ?? null : projectAny(answered[sel.name], sel.selections, vars, doc.fragments);
+        data[key] = sel.selections.length === 0
+          ? answered[sel.name] ?? null
+          : projectAny(answered[sel.name], sel.selections, vars, doc.fragments);
         continue;
       }
 
       const value = root[sel.name];
       data[key] = sel.selections.length === 0 ? value ?? null : projectAny(value, sel.selections, vars, doc.fragments);
+    } catch (err) {
+      // a field that throws nulls its own key, and the rest of the answer stands
+      data[key] = null;
+      errors.push(errorEntry(err instanceof Error ? err.message : 'Internal error.', [key]));
     }
-    return { data };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Internal error.';
-    return { errors: [{ message, locations: [], path: [] }], data: null };
   }
+
+  return errors.length > 0 ? { errors, data } : { data };
 }
 
 /** Answer one POST /api/graphql or /graphql request. */

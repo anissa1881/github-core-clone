@@ -16,3 +16,6 @@ t-git.ts
 t-gql.ts
 smoke*.ts
 dbg*.ts
+.parts/
+t-gqlcheck.ts
+graphql.new.ts
