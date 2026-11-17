@@ -2,6 +2,7 @@
 // MCP from its own store; no UI, no outside service, no git binary.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { writeFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -56,9 +57,55 @@ function methodNotAllowed(res: ServerResponse, allow: string): void {
   respond(res, 405, { message: 'Method Not Allowed' }, { allow });
 }
 
+/** Per-bucket request timings, so a slow surface is measured instead of guessed. */
+const timings = new Map<string, number[]>();
+
+/** The bucket one request belongs to: the surface, not the path. */
+function bucketOf(path: string, method: string): string {
+  if (path.includes('.git/git-receive-pack')) return 'git-receive-pack';
+  if (path.includes('.git/git-upload-pack')) return 'git-upload-pack';
+  if (path.includes('.git/info/refs')) return 'git-info-refs';
+  if (path === '/mcp') return 'mcp';
+  if (path.startsWith('/api/graphql') || path === '/graphql') return 'graphql';
+  if (path.startsWith('/api/v3')) return `rest-${method.toLowerCase()}`;
+  return 'other';
+}
+
+/** Write the timing summary beside the process, once, as it exits. */
+function writeTimings(): void {
+  const out: Record<string, unknown> = {};
+  for (const [key, values] of timings) {
+    if (values.length === 0) continue;
+    const sorted = [...values].sort((a, b) => a - b);
+    const total = sorted.reduce((a, b) => a + b, 0);
+    out[key] = {
+      requests: sorted.length,
+      total_ms: Math.round(total),
+      mean_ms: Number((total / sorted.length).toFixed(1)),
+      p50_ms: sorted[Math.floor(sorted.length / 2)],
+      max_ms: sorted[sorted.length - 1],
+    };
+  }
+  try {
+    writeFileSync(`${process.env.TMPDIR ?? '/tmp'}/forge-timing.json`, JSON.stringify(out));
+  } catch {
+    // profiling must never break a trial
+  }
+}
+
+process.on('exit', writeTimings);
+
 /** Build the server. It binds nothing until main.ts listens on its ephemeral port. */
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
+    const startedAt = Date.now();
+    res.once('finish', () => {
+      const key = bucketOf((req.url ?? '/').split('?')[0]!, req.method ?? 'GET');
+      const list = timings.get(key);
+      const elapsed = Date.now() - startedAt;
+      if (list === undefined) timings.set(key, [elapsed]);
+      else list.push(elapsed);
+    });
     void route(req, res).catch((err: unknown) => {
       // never leave a request unanswered, and never answer HTML
       if (res.headersSent) {
@@ -164,7 +211,11 @@ async function handleSmart(
     return;
   }
 
-  const refs = advertiseRefs(repo.store, new Map(Object.entries(repo.meta.branches)));
+  const refs = advertiseRefs(
+    repo.store,
+    new Map(Object.entries(repo.meta.branches)),
+    new Map(Object.entries(repo.meta.tags ?? {})),
+  );
   const head = `refs/heads/${repo.meta.default_branch}`;
   const wantsV2 = (req.headers['git-protocol'] ?? '')
     .toString()
@@ -194,10 +245,24 @@ async function handleSmart(
   writeSmart(res, 200, answer.body, answer.headers);
 }
 
-/** Move the repository's branch map to what a push's report said it accepted. */
+/** Move the repository's branch and tag maps to what a push's report said it accepted. */
 function applyPush(repo: Repo, applied: ReadonlyArray<{ ref: string; newOid: string }>): void {
   let moved = false;
   for (const update of applied) {
+    const tag = /^refs\/tags\/(.+)$/.exec(update.ref);
+    if (tag) {
+      const name = tag[1]!;
+      const tags = (repo.meta.tags ??= {});
+      if (update.newOid === ZERO_OID) {
+        delete tags[name];
+        moved = true;
+        continue;
+      }
+      if (!repo.store.has(update.newOid)) continue;
+      tags[name] = update.newOid;
+      moved = true;
+      continue;
+    }
     const m = /^refs\/heads\/(.+)$/.exec(update.ref);
     if (!m) continue;
     const branch = m[1]!;

@@ -6,6 +6,7 @@ import type { ServerResponse } from 'node:http';
 import { DELIM, FLUSH, decodePackets, pkt } from './pktline.ts';
 import {
   OBJ_COMMIT,
+  OBJ_TAG,
   OBJ_TREE,
   type GitObject,
   type ObjectStore,
@@ -78,17 +79,17 @@ export function reachableObjects(
   const out: string[] = [];
   const seen = new Set<string>();
 
-  /** Add a tree and everything under it, depth first. */
+  /** Add a tree and everything under it, depth first, never one the client already holds. */
   const addTree = (treeOid: string): void => {
     const stack = [treeOid];
     while (stack.length > 0) {
       const t = stack.pop()!;
-      if (seen.has(t)) continue;
+      if (seen.has(t) || exclude.has(t)) continue;
       seen.add(t);
       out.push(t);
       for (const e of readTree(store, t)) {
         if (e.type === OBJ_TREE) stack.push(e.oid);
-        else if (!seen.has(e.oid)) {
+        else if (!seen.has(e.oid) && !exclude.has(e.oid)) {
           seen.add(e.oid);
           out.push(e.oid);
         }
@@ -274,8 +275,9 @@ function lsRefs(
   }
   for (const r of refs) {
     if (!matches(r.name)) continue;
-    parts.push(pkt(`${r.oid} ${r.name}\n`));
-    if (peel && r.peeled) parts.push(pkt(`${r.peeled} ${r.name}^{}\n`));
+    // gitprotocol-v2 carries the peel as a `peeled:<oid>` attribute on the ref's own line
+    const peeled = peel && r.peeled ? ` peeled:${r.peeled}` : '';
+    parts.push(pkt(`${r.oid} ${r.name}${peeled}\n`));
   }
   parts.push(FLUSH);
   return Buffer.concat(parts);
@@ -313,7 +315,13 @@ function parseFetchArgs(args: ReadonlyArray<string>): FetchWants {
  * and are excluded from the pack.
  */
 function buildFetchPack(store: ObjectStore, f: FetchWants): { pack: Buffer; shallow: string[] } {
-  const exclude = new Set<string>(f.haves);
+  // A have says the client holds that object and everything reachable from it, so the whole
+  // closure is excluded: a shared tree or blob the client already has must not be re-sent.
+  const exclude = new Set<string>();
+  for (const have of f.haves) {
+    if (!isOid(have)) continue;
+    for (const oid of reachableObjects(store, [have])) exclude.add(oid);
+  }
   let tips = f.wants.filter((w) => isOid(w));
   const shallow: string[] = [];
 
@@ -353,6 +361,46 @@ function buildFetchPack(store: ObjectStore, f: FetchWants): { pack: Buffer; shal
   return { pack: writePack(reachableObjects(store, tips, exclude), store), shallow: [...new Set(shallow)] };
 }
 
+/**
+ * The built packs, keyed by what the fetch asked for. Every id in the key is a content hash, so an
+ * identical key can only answer identical bytes: the 50 concurrent depth-1 clones of one repo build
+ * the pack once and replay it. Bounded in entries and bytes, oldest evicted first.
+ */
+const packCache = new Map<string, { pack: Buffer; shallow: string[] }>();
+const PACK_CACHE_ENTRIES = 24;
+const PACK_CACHE_BYTES = 32 * 1024 * 1024;
+let packCacheBytes = 0;
+
+/** The pack a fetch answers with, from the cache when the same want/have/deepen was asked before. */
+function cachedFetchPack(store: ObjectStore, f: FetchWants): { pack: Buffer; shallow: string[] } {
+  const key = JSON.stringify([
+    [...f.wants].sort(),
+    [...f.haves].sort(),
+    f.deepen,
+    f.shallow,
+  ]);
+  const hit = packCache.get(key);
+  if (hit !== undefined) {
+    // refresh the entry's position so the eviction is least-recently-used
+    packCache.delete(key);
+    packCache.set(key, hit);
+    return hit;
+  }
+  const built = buildFetchPack(store, f);
+  if (built.pack.length <= PACK_CACHE_BYTES) {
+    packCache.set(key, built);
+    packCacheBytes += built.pack.length;
+    while (packCache.size > PACK_CACHE_ENTRIES || packCacheBytes > PACK_CACHE_BYTES) {
+      const oldest = packCache.keys().next();
+      if (oldest.done === true) break;
+      const evicted = packCache.get(oldest.value);
+      packCache.delete(oldest.value);
+      if (evicted !== undefined) packCacheBytes -= evicted.pack.length;
+    }
+  }
+  return built;
+}
+
 /** Frame `data` on side-band channel 1, as a client that advertised side-band-64k expects. */
 function sideBand(data: Buffer): Buffer {
   const parts: Buffer[] = [];
@@ -382,7 +430,7 @@ export function servicePost(
   }
   if (req.command === 'fetch') {
     const asked = parseFetchArgs(req.args);
-    const { pack, shallow } = buildFetchPack(store, asked);
+    const { pack, shallow } = cachedFetchPack(store, asked);
 
     // v2 fetch answers in sections: acknowledgments (only when the client sent haves), then
     // shallow-info inside that same section, then packfile whose payload rides side-band 1.
@@ -505,7 +553,7 @@ function receivePack(
 
   const ingested = new Set<string>();
   if (rest.length >= 12 && rest.subarray(0, 4).toString('ascii') === 'PACK') {
-    for (const [oid, o] of readPack(rest, store.allObjects())) {
+    for (const [oid, o] of readPack(rest, (oid) => store.read(oid))) {
       ingested.add(oid);
       if (!store.has(oid)) store.write(o.type, o.data);
     }
@@ -572,19 +620,35 @@ export function parseSmartPath(path: string): SmartTarget | null {
   };
 }
 
+/** The commit an object peels to: a tag chain is followed, a commit answers itself, else null. */
+export function peelToCommit(store: ObjectStore, oid: string): string | null {
+  let current = oid;
+  for (let depth = 0; depth < 16; depth += 1) {
+    const o = store.read(current);
+    if (!o) return null;
+    if (o.type === OBJ_COMMIT) return current;
+    if (o.type !== OBJ_TAG) return null;
+    const m = /^object ([0-9a-f]{40})$/m.exec(o.data.toString('utf8'));
+    if (!m) return null;
+    current = m[1]!;
+  }
+  return null;
+}
+
 /** The ref list a repository advertises: its branches and tags that point at something. */
 export function advertiseRefs(
   store: ObjectStore,
   branches: ReadonlyMap<string, string>,
   tags: ReadonlyMap<string, string> = new Map(),
 ): Ref[] {
-  void store;
   const refs: Ref[] = [];
   for (const [name, oid] of branches) {
     if (oid && oid !== ZERO) refs.push({ name: `refs/heads/${name}`, oid });
   }
   for (const [name, oid] of tags) {
-    if (oid && oid !== ZERO) refs.push({ name: `refs/tags/${name}`, oid });
+    if (!oid || oid === ZERO) continue;
+    const peeled = peelToCommit(store, oid);
+    refs.push(peeled && peeled !== oid ? { name: `refs/tags/${name}`, oid, peeled } : { name: `refs/tags/${name}`, oid });
   }
   return refs;
 }

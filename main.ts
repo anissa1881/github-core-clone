@@ -3,6 +3,7 @@
 // trial is over, and then exits 0. A program that never registers leaves the env with nothing to test.
 
 import { createApp } from './app.ts';
+import { flushAll } from './store.ts';
 
 /** Where the env listens, from MAKEFUN_ENV_URL. Without it there is no env to talk to. */
 const ENV_URL = readEnvUrl();
@@ -97,6 +98,8 @@ async function main(): Promise<void> {
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
+  // the trial is over: everything the forge changed is written before the process leaves
+  flushAll();
   await new Promise<void>((resolve) => server.close(() => resolve()));
   process.stdout.write('[entry] done\n');
 }
@@ -104,6 +107,14 @@ async function main(): Promise<void> {
 if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
   process.exit(1);
+}
+
+// a stop signal writes the store out before the process leaves, so no change is lost
+for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(signal, () => {
+    flushAll();
+    process.exit(0);
+  });
 }
 
 try {

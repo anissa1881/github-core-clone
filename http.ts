@@ -30,6 +30,23 @@ export function respond(
   res.end(text);
 }
 
+/** Send one already-serialized JSON reply, with the same headers respond() sets. */
+export function respondText(
+  res: ServerResponse,
+  status: number,
+  text: string,
+  headers: Readonly<Record<string, string>> = {},
+): void {
+  if (res.headersSent) return;
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': Buffer.byteLength(text),
+    'x-github-request-id': requestId(),
+    ...headers,
+  });
+  res.end(text);
+}
+
 /** Send an empty reply (204 and the like). */
 export function respondEmpty(
   res: ServerResponse,

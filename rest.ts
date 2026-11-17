@@ -15,8 +15,29 @@ import {
   walkHistory,
 } from './git/model.ts';
 import type { Forge, Issue, Pull, Repo } from './store.ts';
-import { readBody, respond } from './http.ts';
-import { mergeViaMcp } from './merge.ts';
+import { readBody, respond, respondText } from './http.ts';
+
+/**
+ * Serialized single-issue bodies, keyed by the repository revision and the issue number. A read loop
+ * over one issue then pays JSON.stringify once; any save bumps `rev` and the old entries go stale.
+ */
+const issueBodyCache = new Map<string, string>();
+const ISSUE_BODY_CACHE_MAX = 512;
+
+/** The JSON text of one issue, newline-terminated as respond() writes it. */
+function issueBody(repo: Repo, issue: Issue, base: string): string {
+  const key = `${repo.meta.owner}/${repo.meta.name}#${repo.rev}#${issue.number}`;
+  const hit = issueBodyCache.get(key);
+  if (hit !== undefined) return hit;
+  const text = `${JSON.stringify(issueJson(repo, issue, base))}\n`;
+  issueBodyCache.set(key, text);
+  if (issueBodyCache.size > ISSUE_BODY_CACHE_MAX) {
+    const oldest = issueBodyCache.keys().next();
+    if (oldest.done !== true) issueBodyCache.delete(oldest.value);
+  }
+  return text;
+}
+import { mergeViaMcp, MergeConflictError } from './merge.ts';
 
 /** One route's answer: `handled` once this module wrote one, `unmatched` when the path is not ours. */
 export type RestOutcome = 'handled' | 'unmatched';
@@ -160,7 +181,7 @@ function commitJson(repo: Repo, oid: string, base: string): Record<string, unkno
         email: c.committer.email,
         date: new Date(c.committer.date * 1000).toISOString(),
       },
-      message: c.message,
+      message: c.message.replace(/\n$/, ''),
       tree: { sha: c.tree, url: `${repoUrl}/git/trees/${c.tree}` },
       comment_count: 0,
     },
@@ -660,13 +681,25 @@ async function contentsRoute(
     return;
   }
 
+  // a write names its branch in the body (`branch`), which wins over the ref query; GET uses the query
+  const targetOf = (body: Record<string, unknown>): string | null => {
+    const asked = typeof body.branch === 'string' && body.branch !== '' ? body.branch : branch;
+    return asked === m.default_branch || repo.branchTip(asked) ? asked : null;
+  };
+
   if (method === 'PUT' || method === 'POST') {
     const body = await readBody(req, res);
     if (body === null) return;
+    const target = targetOf(body);
+    if (target === null) {
+      respond(res, 404, { message: `Branch ${String(body.branch)} not found` });
+      return;
+    }
+    const targetFiles = target === branch ? files : filesOfBranch(repo, target);
 
     const decoded = Buffer.from(String(body.content ?? '').replace(/\n/g, ''), 'base64');
     const givenSha = typeof body.sha === 'string' && body.sha !== '' ? body.sha : null;
-    const existing = files.get(path);
+    const existing = targetFiles.get(path);
 
     // an update must name the sha it replaces, and a create must not name one
     if (existing) {
@@ -683,10 +716,10 @@ async function contentsRoute(
     }
 
     const blob = repo.store.write(OBJ_BLOB, decoded);
-    const next = new Map(files);
+    const next = new Map(targetFiles);
     next.set(path, { oid: blob, mode: '100644' });
     const message = typeof body.message === 'string' && body.message !== '' ? body.message : `Update ${path}`;
-    const commit = commitFiles(repo, branch, next, message);
+    const commit = commitFiles(repo, target, next, message);
     respond(res, existing ? 200 : 201, {
       content: fileJson(repo, base, path, blob),
       commit: {
@@ -701,14 +734,20 @@ async function contentsRoute(
   if (method === 'DELETE') {
     const body = await readBody(req, res);
     if (body === null) return;
-    if (!files.has(path)) {
+    const target = targetOf(body);
+    if (target === null) {
+      respond(res, 404, { message: `Branch ${String(body.branch)} not found` });
+      return;
+    }
+    const targetFiles = target === branch ? files : filesOfBranch(repo, target);
+    if (!targetFiles.has(path)) {
       respond(res, 404, { message: 'Not Found' });
       return;
     }
-    const next = new Map(files);
+    const next = new Map(targetFiles);
     next.delete(path);
     const message = typeof body.message === 'string' && body.message !== '' ? body.message : `Delete ${path}`;
-    const commit = commitFiles(repo, branch, next, message);
+    const commit = commitFiles(repo, target, next, message);
     respond(res, 200, { commit: { sha: commit, message }, content: null });
     return;
   }
@@ -844,7 +883,7 @@ async function issuesRoute(
 
     if (tail.length === 2) {
       if (method === 'GET') {
-        respond(res, 200, issueJson(repo, issue, base));
+        respondText(res, 200, issueBody(repo, issue, base));
         return;
       }
       if (method === 'PATCH' || method === 'POST') {
@@ -933,6 +972,7 @@ async function pullsRoute(
         state: 'open',
         head,
         base: baseBranch,
+        base_sha: repo.branchTip(baseBranch) ?? undefined,
         user: m.owner,
         created_at: now,
         updated_at: now,
@@ -981,8 +1021,18 @@ async function pullsRoute(
           respond(res, 404, { message: 'Head branch not found' });
           return;
         }
-        // the merge runs through the one path MCP shares, so both surfaces answer the same sha
-        const sha = mergeViaMcp(repo, pr);
+        // the merge runs through the one path MCP shares, so both surfaces answer the same sha;
+        // a head and a base that both moved over the same file is a conflict, answered 405
+        let sha: string;
+        try {
+          sha = mergeViaMcp(repo, pr);
+        } catch (err) {
+          if (err instanceof MergeConflictError) {
+            respond(res, 405, { message: err.message, documentation_url: 'https://docs.github.com/rest/pulls/pulls#merge-a-pull-request' });
+            return;
+          }
+          throw err;
+        }
         respond(res, 200, { sha, merged: true, message: 'Pull Request successfully merged' });
         return;
       }

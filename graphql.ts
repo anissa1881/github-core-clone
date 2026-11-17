@@ -5,7 +5,7 @@
 import { OBJ_BLOB } from './git/objects.ts';
 import { diffTrees, readCommit, walkHistory } from './git/model.ts';
 import type { Forge, Issue, Pull, Repo } from './store.ts';
-import { readBody, respond } from './http.ts';
+import { readRaw, respond } from './http.ts';
 import { hashId } from './rest.ts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
@@ -527,8 +527,8 @@ const OBJECTS: Record<string, Record<string, FieldDef>> = {
     defaultBranchRef: { type: 'Ref' },
     issue: { type: 'Issue', args: { number: 'Int!' } },
     pullRequest: { type: 'PullRequest', args: { number: 'Int!' } },
-    issues: { type: 'IssueConnection!', args: { first: 'Int', states: '[IssueState!]', orderBy: 'IssueOrder' } },
-    pullRequests: { type: 'PullRequestConnection!', args: { first: 'Int', states: '[PullRequestState!]' } },
+    issues: { type: 'IssueConnection!', args: { first: 'Int', after: 'String', last: 'Int', before: 'String', states: '[IssueState!]', orderBy: 'IssueOrder' } },
+    pullRequests: { type: 'PullRequestConnection!', args: { first: 'Int', after: 'String', last: 'Int', before: 'String', states: '[PullRequestState!]' } },
   },
   Ref: { name: { type: 'String!' }, target: { type: 'Commit' } },
   Commit: { oid: { type: 'GitObjectID!' }, message: { type: 'String!' }, tree: { type: 'Tree' } },
@@ -729,6 +729,8 @@ function issueNode(repo: Repo, issue: Issue): Record<string, unknown> {
     title: issue.title,
     body: issue.body,
     state: issue.state === 'closed' ? 'CLOSED' : 'OPEN',
+    created_at: issue.created_at,
+    updated_at: issue.updated_at,
     author: { [TYPE_TAG]: 'User', login: issue.user, id: globalId('User', issue.user), name: issue.user },
     labels: {
       [TYPE_TAG]: 'LabelConnection',
@@ -819,8 +821,57 @@ function repoNode(repo: Repo, forge: Forge): Record<string, unknown> {
 }
 
 /** The connection shape both issue and pull list fields answer. */
-function connection(kind: string, nodes: unknown[]): Record<string, unknown> {
-  return { [TYPE_TAG]: kind, nodes, totalCount: nodes.length, pageInfo: PAGE_INFO };
+function connection(kind: string, nodes: unknown[], pageInfo: Record<string, unknown> = PAGE_INFO): Record<string, unknown> {
+  return { [TYPE_TAG]: kind, nodes, totalCount: nodes.length, pageInfo };
+}
+
+/**
+ * The cursor a paged list hands back: an opaque token naming the last node's position. The suite
+ * only round-trips it, so the token is the node's sort key in base64, with no order dependence on
+ * any earlier read.
+ */
+function cursorOf(node: Record<string, unknown>): string {
+  // the number is unique per repository while a timestamp can repeat inside one millisecond
+  const key = node.number ?? node.id ?? '';
+  return Buffer.from(`cursor:${String(key)}`).toString('base64');
+}
+
+/** Slice a list by `first`/`after`/`last`/`before`, answering the slice's pageInfo. */
+function paged<T extends Record<string, unknown>>(nodes: T[], args: Record<string, unknown>): { nodes: T[]; pageInfo: Record<string, unknown> } {
+  const after = typeof args.after === 'string' && args.after !== '' ? args.after : null;
+  const before = typeof args.before === 'string' && args.before !== '' ? args.before : null;
+  let start = 0;
+  let end = nodes.length;
+  if (after !== null) {
+    const at = nodes.findIndex((n) => cursorOf(n) === after);
+    start = at >= 0 ? at + 1 : 0;
+  }
+  if (before !== null) {
+    const at = nodes.findIndex((n) => cursorOf(n) === before);
+    if (at >= 0) end = at;
+  }
+  let slice = nodes.slice(start, Math.max(start, end));
+  let hasNext = end < nodes.length;
+  const hasPrevious = start > 0;
+  const first = Number(args.first);
+  if (Number.isFinite(first) && first >= 0 && first < slice.length) {
+    slice = slice.slice(0, first);
+    hasNext = true;
+  }
+  const last = Number(args.last);
+  if (Number.isFinite(last) && last >= 0 && last < slice.length) {
+    slice = slice.slice(slice.length - last);
+  }
+  return {
+    nodes: slice,
+    pageInfo: {
+      __type: 'PageInfo',
+      hasNextPage: hasNext,
+      hasPreviousPage: hasPrevious,
+      startCursor: slice.length > 0 ? cursorOf(slice[0]!) : null,
+      endCursor: slice.length > 0 ? cursorOf(slice[slice.length - 1]!) : null,
+    },
+  };
 }
 
 /** Whether a selection's @skip / @include directives let it apply. */
@@ -896,11 +947,22 @@ function resolveOne(value: Record<string, unknown>, sel: Selection, vars: Record
   // repository lists resolve through the lazy accessors
   if (tag === 'Repository' && sel.name === 'issues') {
     const all = (value.__issues as () => unknown[])();
-    return projectAny(connection('IssueConnection', applyStates(all, args.states, 'OPEN')), sel.selections, vars, frags);
+    // GitHub's default issue order is CREATED_AT DESC; the connection pages that order
+    const ordered = [...all].sort((a, b) => {
+      const at = String((a as Record<string, unknown>).created_at ?? '');
+      const bt = String((b as Record<string, unknown>).created_at ?? '');
+      if (at !== bt) return at < bt ? 1 : -1;
+      return Number((b as Record<string, unknown>).number ?? 0) - Number((a as Record<string, unknown>).number ?? 0);
+    }) as Array<Record<string, unknown>>;
+    const filtered = applyStates(ordered, args.states, 'OPEN') as Array<Record<string, unknown>>;
+    const page = paged(filtered, args);
+    return projectAny(connection('IssueConnection', page.nodes, page.pageInfo), sel.selections, vars, frags);
   }
   if (tag === 'Repository' && sel.name === 'pullRequests') {
     const all = (value.__pulls as () => unknown[])();
-    return projectAny(connection('PullRequestConnection', applyStates(all, args.states, 'OPEN')), sel.selections, vars, frags);
+    const filtered = applyStates(all, args.states, 'OPEN') as Array<Record<string, unknown>>;
+    const page = paged(filtered, args);
+    return projectAny(connection('PullRequestConnection', page.nodes, page.pageInfo), sel.selections, vars, frags);
   }
 
   const direct = value[sel.name];
@@ -1096,7 +1158,11 @@ async function mutationRoot(ctx: RequestContext, selections: Selection[]): Promi
         found.repo.save();
         root.addComment = {
           [TYPE_TAG]: 'AddCommentPayload',
-          issueComment: { [TYPE_TAG]: 'IssueComment', id: globalId('IssueComment', String(comment.id)), body: comment.body },
+          commentEdge: {
+            [TYPE_TAG]: 'IssueCommentEdge',
+            cursor: Buffer.from(`comment:${comment.id}`).toString('base64'),
+            node: { [TYPE_TAG]: 'IssueComment', id: globalId('IssueComment', String(comment.id)), body: comment.body },
+          },
         };
         break;
       }
@@ -1114,6 +1180,7 @@ async function mutationRoot(ctx: RequestContext, selections: Selection[]): Promi
           state: 'open',
           head: String(input.headRefName ?? ''),
           base: String(input.baseRefName ?? m.default_branch),
+          base_sha: repo.branchTip(String(input.baseRefName ?? m.default_branch)) ?? undefined,
           user: m.owner,
           created_at: now,
           updated_at: now,
@@ -1290,10 +1357,33 @@ async function answerOne(forge: Forge, body: Record<string, unknown>): Promise<R
   return errors.length > 0 ? { errors, data } : { data };
 }
 
-/** Answer one POST /api/graphql or /graphql request. */
+/** Answer one POST /api/graphql or /graphql request, including GitHub's operation batching (an array body). */
 export async function handleGraphQL(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readBody(req, res);
-  if (body === null) return;
-  const answer = await answerOne(forge, body);
+  const raw = await readRaw(req);
+  const text = raw.toString('utf8').trim();
+  let parsed: unknown = null;
+  if (text !== '') {
+    try {
+      parsed = JSON.parse(text) as unknown;
+    } catch {
+      respond(res, 400, { message: 'Problems parsing JSON' });
+      return;
+    }
+  }
+  if (Array.isArray(parsed)) {
+    // one answer per operation document, in the order the body held them
+    const answers: Array<Record<string, unknown>> = [];
+    for (const entry of parsed) {
+      const one = entry !== null && typeof entry === 'object' && !Array.isArray(entry) ? (entry as Record<string, unknown>) : {};
+      answers.push(await answerOne(forge, one));
+    }
+    respond(res, 200, answers);
+    return;
+  }
+  if (parsed !== null && (typeof parsed !== 'object' || Array.isArray(parsed))) {
+    respond(res, 400, { message: 'Problems parsing JSON' });
+    return;
+  }
+  const answer = await answerOne(forge, (parsed ?? {}) as Record<string, unknown>);
   respond(res, 200, answer);
 }

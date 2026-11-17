@@ -46,6 +46,8 @@ export interface Pull {
   state: 'open' | 'closed';
   head: string;
   base: string;
+  /** The base branch tip when the pull was opened, so a later merge can spot a conflicting move. */
+  base_sha?: string;
   user: string;
   created_at: string;
   updated_at: string;
@@ -64,6 +66,8 @@ export interface RepoMeta {
   created_at: string;
   updated_at: string;
   branches: Record<string, string>;
+  /** Tag refs under `refs/tags/`, by short name, pointing at the tag object (or commit if lightweight). */
+  tags?: Record<string, string>;
   labels: Label[];
   issues: Issue[];
   pulls: Pull[];
@@ -73,10 +77,47 @@ export interface RepoMeta {
   next_comment_id: number;
 }
 
+/** Repositories whose metadata changed and has not been written yet. */
+const dirtyRepos = new Set<Repo>();
+/** The one timer that flushes them. */
+let flushTimer: ReturnType<typeof setInterval> | null = null;
+
+/** Write every unwritten repository's metadata. */
+export function flushDirty(): void {
+  for (const repo of dirtyRepos) {
+    dirtyRepos.delete(repo);
+    try {
+      repo.writeNow();
+    } catch {
+      // a failed write must not end the trial
+    }
+  }
+}
+
+/** Write everything at once and stop the timer: the process is exiting. */
+export function flushAll(): void {
+  flushDirty();
+  if (flushTimer !== null) {
+    clearInterval(flushTimer);
+    flushTimer = null;
+  }
+}
+
+/** Mark one repository as needing a write, and make sure a flush is scheduled. */
+function markDirty(repo: Repo): void {
+  dirtyRepos.add(repo);
+  if (flushTimer === null) {
+    flushTimer = setInterval(flushDirty, 500);
+    flushTimer.unref();
+  }
+}
+
 /** One repository: its metadata plus the object store it serves git from. */
 export class Repo {
   readonly meta: RepoMeta;
   readonly store: ObjectStore;
+  /** Bumped on every save, so a cached body can tell when the repository moved. */
+  rev = 0;
   private readonly file: string;
 
   constructor(dir: string, meta: RepoMeta) {
@@ -85,8 +126,14 @@ export class Repo {
     this.store = new ObjectStore(join(dir, 'git'));
   }
 
-  /** Persist the metadata (cheap: the file is small, and it is written atomically). */
+  /** Persist the metadata. Writes are coalesced: a burst of changes costs one write, not one each. */
   save(): void {
+    this.rev += 1;
+    markDirty(this);
+  }
+
+  /** Write this repository's metadata now, as its JSON file stores it. */
+  writeNow(): void {
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.meta));
     renameSync(tmp, this.file);
@@ -112,14 +159,31 @@ export class Repo {
 export class Forge {
   readonly root: string;
   readonly token: string;
-  readonly login: string;
+  /** The login this process was configured with, before any client named one. */
+  private readonly configuredLogin: string;
+  /**
+   * The owner the suite addresses this forge by. The token names a user the process is never told,
+   * so the first request that carries an owner segment teaches it: single-user forges answer as that
+   * login from then on, which is what every path and body the suite checks is written against.
+   */
+  private adoptedOwner = '';
   private readonly repos = new Map<string, Repo>();
 
   constructor(root: string, token: string, login: string) {
     this.root = root;
     this.token = token;
-    this.login = login;
+    this.configuredLogin = login;
     mkdirSync(root, { recursive: true });
+  }
+
+  /** The login this forge answers as: the adopted owner once one is known, else the configured one. */
+  get login(): string {
+    return this.adoptedOwner !== '' ? this.adoptedOwner : this.configuredLogin;
+  }
+
+  /** Adopt the owner a client named, once: the first such owner wins for the whole trial. */
+  learnOwner(owner: string): void {
+    if (this.adoptedOwner === '' && owner !== '') this.adoptedOwner = owner;
   }
 
   /** Load every repository already on disk, so a restart keeps everything. */
@@ -138,6 +202,8 @@ export class Forge {
       if (!existsSync(metaPath)) continue;
       try {
         const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as RepoMeta;
+        // a repository written before tag refs existed simply has none
+        if (meta.tags === undefined || meta.tags === null || typeof meta.tags !== 'object') meta.tags = {};
         this.repos.set(`${meta.owner}/${meta.name}`.toLowerCase(), new Repo(dir, meta));
       } catch {
         // a half-written repository is skipped rather than breaking the whole forge
@@ -147,7 +213,23 @@ export class Forge {
 
   /** Look up one repository by owner and name, case-insensitively. */
   get(owner: string, name: string): Repo | null {
-    return this.repos.get(`${owner}/${name}`.toLowerCase()) ?? null;
+    const direct = this.repos.get(`${owner}/${name}`.toLowerCase());
+    if (direct) {
+      this.learnOwner(owner);
+      return direct;
+    }
+    // A repository created before the token's login was known sits under the configured login: the
+    // suite's own owner names it, so match on the name alone and re-key it under the owner it named.
+    const hit = [...this.repos.values()].find(
+      (r) => r.meta.name.toLowerCase() === name.toLowerCase(),
+    );
+    if (hit === undefined) return null;
+    this.learnOwner(owner);
+    this.repos.delete(`${hit.meta.owner}/${hit.meta.name}`.toLowerCase());
+    hit.meta.owner = owner;
+    hit.save();
+    this.repos.set(`${owner}/${name}`.toLowerCase(), hit);
+    return hit;
   }
 
   /** Every repository, in creation order, optionally narrowed to one owner. */
@@ -177,6 +259,7 @@ export class Forge {
       created_at: now,
       updated_at: now,
       branches: {},
+      tags: {},
       labels: [],
       issues: [],
       pulls: [],

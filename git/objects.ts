@@ -197,7 +197,13 @@ function zlibConsumed(buf: Buffer, start: number, end: number): number {
  * Read every object in a packfile, resolving OFS_DELTA and REF_DELTA against objects already
  * decoded in this pack and, for a thin pack's REF_DELTA, against `external`.
  */
-export function readPack(pack: Buffer, external?: ReadonlyMap<string, GitObject>): Map<string, GitObject> {
+/** How a pack's external delta bases are found: a lookup, never a pre-built copy of the whole store. */
+export type ObjectLookup = (oid: string) => GitObject | null;
+
+export function readPack(
+  pack: Buffer,
+  external?: ObjectLookup | ReadonlyMap<string, GitObject>,
+): Map<string, GitObject> {
   if (pack.length < 12) throw new Error('pack is shorter than its header');
   const sig = pack.subarray(0, 4).toString('ascii');
   if (sig !== 'PACK') throw new Error(`bad pack signature ${JSON.stringify(sig)}`);
@@ -262,7 +268,11 @@ export function readPack(pack: Buffer, external?: ReadonlyMap<string, GitObject>
       if (!base) throw new Error(`ofs-delta base at ${baseOffset} not resolved earlier in the pack`);
       resolved = { type: base.type, data: applyDelta(base.data, inflated.data) };
     } else if (type === OBJ_REF_DELTA) {
-      const base = out.get(baseOid!) ?? external?.get(baseOid!);
+      const found = out.get(baseOid!);
+      const base =
+        found ??
+        (typeof external === 'function' ? external(baseOid!) : external?.get(baseOid!)) ??
+        undefined;
       if (!base) throw new Error(`ref-delta base ${baseOid} is not in the pack`);
       resolved = { type: base.type, data: applyDelta(base.data, inflated.data) };
     } else {
@@ -279,6 +289,10 @@ export function readPack(pack: Buffer, external?: ReadonlyMap<string, GitObject>
 /** The on-disk store for one repository: loose objects and refs under its directory. */
 export class ObjectStore {
   readonly dir: string;
+  /** Objects this process has already written, so a repeat write costs no syscall. */
+  private readonly written = new Set<string>();
+  /** Object directories already created, so a write ensures each one once. */
+  private readonly ensured = new Set<string>();
 
   constructor(dir: string) {
     this.dir = dir;
@@ -312,15 +326,24 @@ export class ObjectStore {
 
   /** Write one already-hashed object unless it is on disk. */
   private store(oid: string, o: GitObject): void {
+    if (this.written.has(oid)) return;
     const path = this.loosePath(oid);
-    if (existsSync(path)) return;
-    mkdirSync(dirname(path), { recursive: true });
+    const dir = dirname(path);
+    if (!this.ensured.has(dir)) {
+      mkdirSync(dir, { recursive: true });
+      this.ensured.add(dir);
+    }
+    if (existsSync(path)) {
+      this.written.add(oid);
+      return;
+    }
     writeFileSync(path, deflateSync(rawObject(o), { level: 1 }));
+    this.written.add(oid);
   }
 
   /** Write every object of a parsed pack, answering their ids. */
   ingest(pack: Buffer): string[] {
-    const objects = readPack(pack, this.allLoose());
+    const objects = readPack(pack, (oid) => this.read(oid));
     const ids: string[] = [];
     for (const [oid, o] of objects) {
       this.store(oid, o);
@@ -332,6 +355,11 @@ export class ObjectStore {
   /** Every loose object, for a thin pack's external delta bases. */
   allObjects(): Map<string, GitObject> {
     return this.allLoose();
+  }
+
+  /** A lazy lookup, for a pack's external delta bases: costs one object read, not the whole store. */
+  lookup(): ObjectLookup {
+    return (oid) => this.read(oid);
   }
 
   private allLoose(): Map<string, GitObject> {
