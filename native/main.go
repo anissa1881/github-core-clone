@@ -99,21 +99,20 @@ func waitForDone(base string) {
 	}
 }
 
-// bind answers a listener on an ephemeral port, which is the port the env is told about.
+// bind answers a listener on an ephemeral port, which is the port the env is told about. The
+// listener takes every interface, as the TypeScript build's listen(0) does: the env's forwarder
+// reaches this program from its own network, where a loopback-only bind is unreachable.
 func bind() (net.Listener, int) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", ":0")
 	if err != nil {
-		// a host without a loopback address still has one on the wildcard address
-		listener, err = net.Listen("tcp", ":0")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[entry] bind: %v\n", err)
-			os.Exit(1)
-		}
+		fmt.Fprintf(os.Stderr, "[entry] bind: %v\n", err)
+		os.Exit(1)
 	}
 	return listener, listener.Addr().(*net.TCPAddr).Port
 }
 
-// bindPort answers a listener on the port asked for, or an ephemeral one when it is zero.
+// bindPort answers a listener on the port asked for, or an ephemeral one when it is zero. The dev
+// port stays on the loopback address, where only this host's tests reach it.
 func bindPort(want int) (net.Listener, int) {
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", want))
 	if err != nil {

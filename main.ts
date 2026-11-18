@@ -128,7 +128,9 @@ async function main(): Promise<void> {
       const message = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[entry] native could not start: ${message}\n`);
     }
-    if (code === 0 || Date.now() - startedAt > 5_000) return;
+    // the binary registers its own port, so a late fallback would leave the env talking to a port
+    // nothing serves: only a refusal in the first moment can still be replaced by this server
+    if (code === 0 || Date.now() - startedAt > 1_000) return;
     process.stderr.write(`[entry] native left with ${code}; serving from TypeScript\n`);
   }
   const server = createApp();
