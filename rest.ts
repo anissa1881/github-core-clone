@@ -864,7 +864,9 @@ async function issuesRoute(
       list = [...list].sort((a, b) => {
         const av = a[key];
         const bv = b[key];
-        if (av === bv) return 0;
+        // Two writes can land in the same second, and their timestamps then compare equal: the issue
+        // opened later carries the higher number, so the number breaks the tie the way GitHub does.
+        if (av === bv) return direction === 'asc' ? a.number - b.number : b.number - a.number;
         const before = av < bv ? -1 : 1;
         return direction === 'asc' ? before : -before;
       });

@@ -68,6 +68,26 @@ describe('issues: create, read, list', () => {
     assert.deepEqual(numbers, [1, 2, 3]);
   });
 
+  it('breaks a same-second tie by number, newest first', async () => {
+    // Issues opened back to back share a timestamp to the millisecond often enough that the sort has
+    // to be total: GitHub answers the higher number first, so the list is stable whatever the clock
+    // resolution. This is the order gh prints, and a list that tied would fall back to insertion order
+    // and print the oldest of the burst first.
+    await makeRepo(h, 'burst');
+    for (let i = 1; i <= 5; i += 1) await openIssue(h, 'burst', `a burst, number ${i}`);
+    const desc = await api(h, `/api/v3/repos/${LOGIN}/burst/issues?sort=created&direction=desc`);
+    const down = (desc.body as any[]).map((i) => i.number);
+    assert.deepEqual(down, [5, 4, 3, 2, 1]);
+    const asc = await api(h, `/api/v3/repos/${LOGIN}/burst/issues?sort=created&direction=asc`);
+    const up = (asc.body as any[]).map((i) => i.number);
+    assert.deepEqual(up, [1, 2, 3, 4, 5]);
+    const byUpdated = await api(h, `/api/v3/repos/${LOGIN}/burst/issues?sort=updated&direction=desc`);
+    assert.equal(byUpdated.status, 200);
+    assert.equal(byUpdated.body.length, 5);
+    const asked = await api(h, `/api/v3/repos/${LOGIN}/burst/issues?per_page=2&page=2`);
+    assert.equal(asked.body.length, 5, 'the issues list answers every issue it holds, so a page size changes nothing');
+  });
+
   it('closes an issue through a patch, and stops listing it as open', async () => {
     const closed = await api(h, `/api/v3/repos/${LOGIN}/issues/issues/2`, {
       method: 'PATCH',
