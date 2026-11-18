@@ -300,8 +300,8 @@ func InflateOne(buf []byte, start int) (data []byte, next int, err error) {
 // so the decompressor reads exactly its stream instead of buffering a whole window past the end,
 // which would make the next entry's offset wrong.
 type countingReader struct {
-	r io.Reader
-	n int
+	r  io.Reader
+	n  int
 	br io.ByteReader
 }
 

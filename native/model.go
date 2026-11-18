@@ -17,12 +17,12 @@ type Who struct {
 
 // Commit is one parsed commit object.
 type Commit struct {
-	OID     string
-	Tree    string
-	Parents []string
-	Author  Who
+	OID      string
+	Tree     string
+	Parents  []string
+	Author   Who
 	Commiter Who
-	Message string
+	Message  string
 }
 
 // TreeEntry is one entry of a tree object, with the mode git prints.
@@ -362,12 +362,12 @@ func TreeAtPath(store *ObjectStore, rootTree, path string) (string, bool) {
 
 // TreeChange is one changed path between two trees, with the blob ids on both sides.
 type TreeChange struct {
-	Path    string
-	Status  string
-	Before  string
-	After   string
-	Base    []string
-	Head    []string
+	Path   string
+	Status string
+	Before string
+	After  string
+	Base   []string
+	Head   []string
 }
 
 // DiffTrees answers the files that differ between two trees, naming each as added, removed or

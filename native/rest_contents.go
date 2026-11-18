@@ -144,8 +144,8 @@ func (s *Server) contentsRoute(repo *Repo, w http.ResponseWriter, r *http.Reques
 		if exists {
 			if givenSHA != existing.OID {
 				respondJSON(w, 409, map[string]any{
-					"message":            path + " does not match " + existing.OID,
-					"documentation_url":  "https://docs.github.com/rest/repos/contents",
+					"message":           path + " does not match " + existing.OID,
+					"documentation_url": "https://docs.github.com/rest/repos/contents",
 				}, nil)
 				return
 			}

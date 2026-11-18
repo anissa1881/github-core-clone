@@ -22,9 +22,9 @@ func repoJSON(repo *Repo, base string) map[string]any {
 	m := repo.Meta
 	full := m.Owner + "/" + m.Name
 	return map[string]any{
-		"id":      hashID(full),
-		"node_id": nodeID("repo", full),
-		"name":    m.Name,
+		"id":        hashID(full),
+		"node_id":   nodeID("repo", full),
+		"name":      m.Name,
 		"full_name": full,
 		"owner": map[string]any{
 			"login": m.Owner, "id": hashID(m.Owner), "type": "User", "site_admin": false,
@@ -117,20 +117,20 @@ func pullJSON(repo *Repo, pr *Pull, base string) map[string]any {
 		"base": map[string]any{
 			"ref": pr.Base, "label": m.Owner + ":" + pr.Base, "sha": baseSHA,
 		},
-		"user":              map[string]any{"login": pr.User, "id": hashID(pr.User), "type": "User"},
-		"merged":            pr.Merged,
-		"mergeable":         true,
-		"mergeable_state":   mergeableState,
-		"merged_at":         mergedAt,
-		"merge_commit_sha":  mergeSHA,
-		"created_at":        pr.CreatedAt,
-		"updated_at":        pr.UpdatedAt,
-		"url":               base + "/api/v3/repos/" + full + "/pulls/" + strconv.Itoa(pr.Number),
-		"repository_url":    base + "/api/v3/repos/" + full,
-		"commits":           1,
-		"additions":         0,
-		"deletions":         0,
-		"changed_files":     0,
+		"user":             map[string]any{"login": pr.User, "id": hashID(pr.User), "type": "User"},
+		"merged":           pr.Merged,
+		"mergeable":        true,
+		"mergeable_state":  mergeableState,
+		"merged_at":        mergedAt,
+		"merge_commit_sha": mergeSHA,
+		"created_at":       pr.CreatedAt,
+		"updated_at":       pr.UpdatedAt,
+		"url":              base + "/api/v3/repos/" + full + "/pulls/" + strconv.Itoa(pr.Number),
+		"repository_url":   base + "/api/v3/repos/" + full,
+		"commits":          1,
+		"additions":        0,
+		"deletions":        0,
+		"changed_files":    0,
 	}
 }
 

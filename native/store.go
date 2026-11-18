@@ -88,7 +88,44 @@ type Repo struct {
 	// Rev counts saves, so a cached body can tell when the repository moved.
 	Rev int
 
-	mu sync.Mutex
+	mu    sync.Mutex
+	packs packCache
+}
+
+// packCache keeps the last pack a fetch built, keyed by the wants and haves that asked for it: the
+// same clone arrives over and over, and sending a pack already in memory costs a copy instead of
+// walking the history and deflating every object again.
+type packCache struct {
+	mu   sync.Mutex
+	key  string
+	pack []byte
+}
+
+// packCacheLimit is the largest pack worth keeping: a clone of this forge's repositories is far
+// smaller, and a big pack would only cost the trial its memory.
+const packCacheLimit = 4 << 20
+
+// packFor answers the pack a fetch of these wants and haves needs, from memory when this exact
+// fetch already built it.
+func (r *Repo) packFor(wants, haves, shallows []string) []byte {
+	key := strings.Join(wants, ",") + "|" + strings.Join(haves, ",") + "|" + strings.Join(shallows, ",")
+
+	r.packs.mu.Lock()
+	if r.packs.key == key && r.packs.pack != nil {
+		pack := r.packs.pack
+		r.packs.mu.Unlock()
+		return pack
+	}
+	r.packs.mu.Unlock()
+
+	pack := WritePack(reachableObjects(r.Store, wants, haves, shallows), r.Store)
+	if len(pack) <= packCacheLimit {
+		r.packs.mu.Lock()
+		r.packs.key = key
+		r.packs.pack = pack
+		r.packs.mu.Unlock()
+	}
+	return pack
 }
 
 // NewRepo binds a directory and its metadata.
@@ -357,6 +394,7 @@ func slugOf(owner, name string) string {
 func nowISO() string {
 	return time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 }
+
 // Count answers how many repositories this forge holds, for the startup line the env log shows.
 func (f *Forge) Count() int {
 	f.mu.RLock()

@@ -97,16 +97,16 @@ func (s *Server) pullsRoute(repo *Repo, w http.ResponseWriter, r *http.Request, 
 			items := make([]any, 0, 4)
 			for _, d := range DiffTreePatch(repo.Store, treeOfBranch(repo, pr.Base), treeOfBranch(repo, pr.Head)) {
 				items = append(items, map[string]any{
-					"sha":           d.SHA,
-					"filename":      d.Filename,
-					"status":        d.Status,
-					"additions":     d.Additions,
-					"deletions":     d.Deletions,
-					"changes":       d.Changes,
-					"blob_url":      "",
-					"raw_url":       "",
-					"contents_url":  "",
-					"patch":         d.Patch,
+					"sha":          d.SHA,
+					"filename":     d.Filename,
+					"status":       d.Status,
+					"additions":    d.Additions,
+					"deletions":    d.Deletions,
+					"changes":      d.Changes,
+					"blob_url":     "",
+					"raw_url":      "",
+					"contents_url": "",
+					"patch":        d.Patch,
 				})
 			}
 			respondJSON(w, 200, items, nil)

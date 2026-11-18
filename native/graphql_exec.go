@@ -63,13 +63,13 @@ func issueNode(repo *Repo, issue *Issue) map[string]any {
 		})
 	}
 	return map[string]any{
-		tagKey: "Issue",
-		gidKey: globalID("Issue", strconv.Itoa(issue.ID)),
-		"id":   globalID("Issue", strconv.Itoa(issue.ID)),
-		"number": issue.Number,
-		"title":  issue.Title,
-		"body":   issue.Body,
-		"state":  state,
+		tagKey:       "Issue",
+		gidKey:       globalID("Issue", strconv.Itoa(issue.ID)),
+		"id":         globalID("Issue", strconv.Itoa(issue.ID)),
+		"number":     issue.Number,
+		"title":      issue.Title,
+		"body":       issue.Body,
+		"state":      state,
 		"created_at": issue.CreatedAt,
 		"updated_at": issue.UpdatedAt,
 		"author": map[string]any{
@@ -136,14 +136,14 @@ func pullNode(repo *Repo, pr *Pull) map[string]any {
 		})
 	}
 	return map[string]any{
-		tagKey:   "PullRequest",
-		gidKey:   globalID("PullRequest", strconv.Itoa(pr.ID)),
-		"id":     globalID("PullRequest", strconv.Itoa(pr.ID)),
-		"number": pr.Number,
-		"title":  pr.Title,
-		"body":   pr.Body,
-		"state":  state,
-		"merged": pr.Merged,
+		tagKey:        "PullRequest",
+		gidKey:        globalID("PullRequest", strconv.Itoa(pr.ID)),
+		"id":          globalID("PullRequest", strconv.Itoa(pr.ID)),
+		"number":      pr.Number,
+		"title":       pr.Title,
+		"body":        pr.Body,
+		"state":       state,
+		"merged":      pr.Merged,
 		"mergeable":   mergeable,
 		"headRefName": pr.Head,
 		"baseRefName": pr.Base,
@@ -170,20 +170,20 @@ func repoNode(repo *Repo, forge *Forge) map[string]any {
 		}
 	}
 	return map[string]any{
-		tagKey:            "Repository",
-		gidKey:            globalID("Repository", full),
-		"id":              globalID("Repository", full),
-		"databaseId":      hashID("repo:"+full) % 2147483647,
-		"name":            m.Name,
-		"nameWithOwner":   full,
-		"description":     description,
-		"isPrivate":       m.Private,
+		tagKey:          "Repository",
+		gidKey:          globalID("Repository", full),
+		"id":            globalID("Repository", full),
+		"databaseId":    hashID("repo:"+full) % 2147483647,
+		"name":          m.Name,
+		"nameWithOwner": full,
+		"description":   description,
+		"isPrivate":     m.Private,
 		"owner": map[string]any{
 			tagKey: "User", "login": m.Owner, "id": globalID("User", m.Owner), "name": m.Owner,
 		},
-		"viewerPermission":  "ADMIN",
-		"hasIssuesEnabled":  true,
-		"defaultBranchRef":  defaultBranchRef,
+		"viewerPermission": "ADMIN",
+		"hasIssuesEnabled": true,
+		"defaultBranchRef": defaultBranchRef,
 		issuesKey: func() []any {
 			out := make([]any, 0, len(m.Issues))
 			for i := range m.Issues {
@@ -533,9 +533,9 @@ func applyStates(nodes []any, states any, openName string) []any {
 func viewerShape(forge *Forge) map[string]any {
 	repos := forge.List(forge.Login())
 	return map[string]any{
-		tagKey: "User",
-		gidKey: globalID("User", forge.Login()),
-		"id":   globalID("User", forge.Login()),
+		tagKey:  "User",
+		gidKey:  globalID("User", forge.Login()),
+		"id":    globalID("User", forge.Login()),
 		"login": forge.Login(),
 		"name":  forge.Login(),
 		"repositories": map[string]any{

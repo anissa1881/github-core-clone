@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"os"
 	"bytes"
 	"compress/zlib"
 	"encoding/base64"
@@ -10,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -415,8 +415,7 @@ func uploadPackV2(repo *Repo, lines []string) []byte {
 		for _, name := range shallows {
 			out = AppendPktString(out, "shallow "+name+"\n")
 		}
-		oids := reachableObjects(repo.Store, wants, haves, shallows)
-		pack := WritePack(oids, repo.Store)
+		pack := repo.packFor(wants, haves, shallows)
 		out = appendPacketSideband(out, pack)
 		out = AppendFlush(out)
 		return out
@@ -464,7 +463,7 @@ func uploadPackV0(repo *Repo, lines []string) []byte {
 		return out
 	}
 	out := make([]byte, 0, 8192)
-	pack := WritePack(reachableObjects(repo.Store, wants, haves, shallows), repo.Store)
+	pack := repo.packFor(wants, haves, shallows)
 	out = appendPacketSideband(out, pack)
 	out = AppendFlush(out)
 	return out
@@ -643,9 +642,9 @@ func receivePack(repo *Repo, body []byte) []byte {
 	}
 
 	type result struct {
-		ref  string
-		ok   bool
-		why  string
+		ref string
+		ok  bool
+		why string
 	}
 	results := make([]result, 0, len(commands))
 	changed := false
