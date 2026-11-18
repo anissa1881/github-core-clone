@@ -7,6 +7,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHmac } from 'node:crypto';
+import { spawn, type ChildProcess } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { createApp } from '../app.ts';
@@ -27,15 +28,59 @@ export interface Harness {
   close(): Promise<void>;
 }
 
-/** Start the entry on an ephemeral port, against a store nobody else uses. */
+/**
+ * Start the entry on an ephemeral port, against a store nobody else uses. FORGE_NATIVE_BIN makes the
+ * same harness drive the compiled binary instead: it binds a port of its own, says which one on
+ * stdout, and serves until it is stopped, which is exactly how the env runs it.
+ */
 export async function start(opts: {
   token?: string;
   login?: string;
 } = {}): Promise<Harness> {
   const store = mkdtempSync(join(tmpdir(), 'forge-test-'));
+  const token = opts.token ?? TOKEN;
+  const login = opts.login ?? LOGIN;
+
+  const native = process.env.FORGE_NATIVE_BIN;
+  if (native !== undefined && native !== '') {
+    const child: ChildProcess = spawn(native, [], {
+      env: {
+        ...process.env,
+        MAKEFUN_DEV_PORT: '0',
+        MAKEFUN_STORE_DIR: store,
+        MAKEFUN_SHOP_TOKEN: token,
+        MAKEFUN_SHOP_LOGIN: login,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const port = await new Promise<number>((resolve, reject) => {
+      let seen = '';
+      const timer = setTimeout(() => reject(new Error(`the binary said: ${seen}`)), 15_000);
+      child.stdout?.on('data', (chunk: Buffer) => {
+        seen += chunk.toString('utf8');
+        const hit = /listening on port (\d+)/.exec(seen);
+        if (hit !== null) {
+          clearTimeout(timer);
+          resolve(Number(hit[1]));
+        }
+      });
+      child.once('exit', (code) => {
+        clearTimeout(timer);
+        reject(new Error(`the binary exited with ${String(code)}: ${seen}`));
+      });
+    });
+    return {
+      base: `http://127.0.0.1:${port}`,
+      store,
+      async close(): Promise<void> {
+        child.kill('SIGKILL');
+      },
+    };
+  }
+
   process.env.MAKEFUN_STORE_DIR = store;
-  process.env.MAKEFUN_SHOP_TOKEN = opts.token ?? TOKEN;
-  process.env.MAKEFUN_SHOP_LOGIN = opts.login ?? LOGIN;
+  process.env.MAKEFUN_SHOP_TOKEN = token;
+  process.env.MAKEFUN_SHOP_LOGIN = login;
   const server: Server = createApp();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address() as AddressInfo;

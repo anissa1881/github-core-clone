@@ -2,8 +2,41 @@
 // program binds an ephemeral port, announces that port to the env, serves until the env reports the
 // trial is over, and then exits 0. A program that never registers leaves the env with nothing to test.
 
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { createApp } from './app.ts';
 import { flushAll } from './store.ts';
+
+/**
+ * The vendored native forge: a statically linked Linux amd64 binary built from the Go sources in
+ * native/. It is committed as vendored source, so the entry runs it in place of the TypeScript
+ * server when it is there. FORGE_ENGINE=ts forces the TypeScript server back on.
+ */
+const NATIVE_BIN = join(import.meta.dirname, 'native', process.platform === 'win32' ? 'forge.exe' : 'forge');
+
+/** Answer whether this run should hand the lifecycle to the native binary. */
+function useNative(): boolean {
+  if (process.env.FORGE_ENGINE === 'ts') return false;
+  return existsSync(NATIVE_BIN);
+}
+
+/**
+ * Run the native forge in this process' place: it binds the port, registers and serves until the
+ * env says done, exactly as the TypeScript lifecycle below does. Signals are passed through so a
+ * stop still writes the store out before anything leaves.
+ */
+async function serveNative(): Promise<void> {
+  const child = spawn(NATIVE_BIN, [], { stdio: 'inherit', env: process.env });
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(signal, () => child.kill(signal));
+  }
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', () => resolve());
+  });
+}
 
 /** Where the env listens, from MAKEFUN_ENV_URL. Without it there is no env to talk to. */
 const ENV_URL = readEnvUrl();
@@ -83,6 +116,10 @@ async function waitForDone(): Promise<void> {
 
 /** Bind the forge on an ephemeral port, register it with the env, and wait for the trial to end. */
 async function main(): Promise<void> {
+  if (useNative()) {
+    await serveNative();
+    return;
+  }
   const server = createApp();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
