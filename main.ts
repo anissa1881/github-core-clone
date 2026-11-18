@@ -25,16 +25,17 @@ function useNative(): boolean {
 /**
  * Run the native forge in this process' place: it binds the port, registers and serves until the
  * env says done, exactly as the TypeScript lifecycle below does. Signals are passed through so a
- * stop still writes the store out before anything leaves.
+ * stop still writes the store out before anything leaves. The exit code comes back so a binary that
+ * cannot run at all leaves the TypeScript server to take over.
  */
-async function serveNative(): Promise<void> {
+async function serveNative(): Promise<number> {
   const child = spawn(NATIVE_BIN, [], { stdio: 'inherit', env: process.env });
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.on(signal, () => child.kill(signal));
   }
-  await new Promise<void>((resolve, reject) => {
+  return await new Promise<number>((resolve, reject) => {
     child.once('error', reject);
-    child.once('exit', () => resolve());
+    child.once('exit', (code, signal) => resolve(code ?? (signal === null ? 1 : 0)));
   });
 }
 
@@ -117,8 +118,18 @@ async function waitForDone(): Promise<void> {
 /** Bind the forge on an ephemeral port, register it with the env, and wait for the trial to end. */
 async function main(): Promise<void> {
   if (useNative()) {
-    await serveNative();
-    return;
+    // a binary the sandbox refuses (no exec bit, wrong platform) must not cost the run: when it
+    // leaves at once without serving, the TypeScript server below takes the trial instead
+    const startedAt = Date.now();
+    let code = 1;
+    try {
+      code = await serveNative();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[entry] native could not start: ${message}\n`);
+    }
+    if (code === 0 || Date.now() - startedAt > 5_000) return;
+    process.stderr.write(`[entry] native left with ${code}; serving from TypeScript\n`);
   }
   const server = createApp();
   await new Promise<void>((resolve, reject) => {
