@@ -12,7 +12,7 @@ const ENV_URL = readEnvUrl();
 const REQUEST_TIMEOUT_MS = 30_000;
 /** The wait before the first retry. */
 const RETRY_INITIAL_MS = 250;
-/** The longest wait between retries. */
+/** The longest wait between retries: the schedule is 250, 500, 1000, then 2000 for as long as the trial lasts. */
 const RETRY_MAX_MS = 2_000;
 
 /** The env's origin with any trailing slashes removed, or '' when it was not given. */
