@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Ref is one ref the advertisement names, with the commit a tag peels to when it has one.
@@ -27,12 +28,32 @@ type Server struct {
 	Forge *Forge
 }
 
+// serveMu guards the store against itself: a read may run beside another read, but a change runs
+// alone, and the background metadata write runs alone too. Go's runtime aborts the process on a map
+// that is written while it is being marshalled, so the same lock covers both sides.
+var serveMu sync.RWMutex
+
 // Routes answers every path this binary serves. The git routes come first: they are what the timed
 // workloads drive, and they must not pay for the routing the API routes need.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.route)
+	mux.HandleFunc("/", guard(s.route))
 	return mux
+}
+
+// guard takes the shared lock for a read and the exclusive one for a change, so many fetches run at
+// once while a push, a create or the metadata flush keeps the store to itself.
+func guard(next func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			serveMu.RLock()
+			defer serveMu.RUnlock()
+		} else {
+			serveMu.Lock()
+			defer serveMu.Unlock()
+		}
+		next(w, r)
+	}
 }
 
 // route dispatches one request: the git smart HTTP paths, the API surfaces, then a 404.
@@ -101,17 +122,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 404, map[string]any{"message": "Not Found"}, nil)
 }
 
-// authorized reads the token as a bearer or as git's Basic credentials.
+// authorized reads the token as a bearer or as git's Basic credentials, in any case and spacing the
+// way the TypeScript build's regex does.
 func (s *Server) authorized(r *http.Request) bool {
-	header := r.Header.Get("authorization")
+	header := strings.TrimSpace(r.Header.Get("authorization"))
 	if header == "" {
 		return false
 	}
-	if strings.HasPrefix(header, "Bearer ") {
-		return strings.TrimSpace(header[len("Bearer "):]) == s.Forge.Token
+	if scheme, value, ok := splitScheme(header); ok && scheme == "bearer" {
+		return value == s.Forge.Token
 	}
-	if strings.HasPrefix(header, "Basic ") {
-		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len("Basic "):]))
+	if scheme, value, ok := splitScheme(header); ok && scheme == "basic" {
+		raw, err := base64.StdEncoding.DecodeString(value)
 		if err != nil {
 			return false
 		}
@@ -122,6 +144,15 @@ func (s *Server) authorized(r *http.Request) bool {
 		return text == s.Forge.Token
 	}
 	return false
+}
+
+// splitScheme cuts "Bearer token" into its lower-case scheme and its trimmed value.
+func splitScheme(header string) (string, string, bool) {
+	space := strings.IndexAny(header, " \t")
+	if space <= 0 {
+		return "", "", false
+	}
+	return strings.ToLower(header[:space]), strings.TrimSpace(header[space+1:]), true
 }
 
 // SmartTarget is one git smart HTTP request: which repository, which service and which half of it.

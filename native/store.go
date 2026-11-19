@@ -201,7 +201,7 @@ func (d *dirtySet) add(r *Repo) {
 	})
 }
 
-// flush writes every repository waiting.
+// flush writes every repository waiting, alone: it marshals the metadata a request may be changing.
 func (d *dirtySet) flush() {
 	d.mu.Lock()
 	waiting := make([]*Repo, 0, len(d.repos))
@@ -210,6 +210,11 @@ func (d *dirtySet) flush() {
 	}
 	d.repos = map[*Repo]struct{}{}
 	d.mu.Unlock()
+	if len(waiting) == 0 {
+		return
+	}
+	serveMu.Lock()
+	defer serveMu.Unlock()
 	for _, r := range waiting {
 		r.WriteNow()
 	}
